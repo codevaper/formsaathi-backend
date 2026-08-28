@@ -1,0 +1,11 @@
+flask
+flask-cors
+rembg[cpu]
+onnxruntime
+opencv-python-headless
+Pillow
+groq
+duckduckgo-search
+trafilatura
+beautifulsoup4
+gunicorn
