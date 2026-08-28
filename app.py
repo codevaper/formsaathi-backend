@@ -1,11 +1,13 @@
-import os, io, gc, time, base64
+import os, io, gc, time, base64, urllib.request
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageOps
 import numpy as np
 import cv2
+import onnxruntime as ort
+from rembg import remove, new_session
 
-# Set thread limits for high stability
+# Single-thread limits for CPU efficiency
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -16,10 +18,16 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 2. Built-in OpenCV Face Detector (Instant, zero network download)
+# 2. Load OpenCV Face Detector
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-# 3. Government Form Specifications
+# 3. Load Studio AI Background Session (Pre-cached from build step)
+sess_opts = ort.SessionOptions()
+sess_opts.intra_op_num_threads = 1
+sess_opts.inter_op_num_threads = 1
+ai_session = new_session("u2netp", session_options=sess_opts)
+
+# 4. Official Government Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -41,8 +49,8 @@ class PhotoProcessor:
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Fast downscale for speed
-        original_pil.thumbnail((800, 800), Image.LANCZOS)
+        # Standardize working size (keeps high quality while ensuring fast AI inference)
+        original_pil.thumbnail((1200, 1200), Image.LANCZOS)
         original_np = np.array(original_pil)
 
         # 2. Detect face
@@ -56,17 +64,17 @@ class PhotoProcessor:
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop face with government aspect ratio
+        # 3. Crop face with government 75% head-coverage ratio
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Instant Studio White Background Isolation (<0.08s)
-        white_bg_pil = self._apply_studio_white_background(cropped_pil)
+        # 4. High-Quality Neural Background Removal (The Original Colab Method)
+        white_bg_pil = self._replace_background_studio(cropped_pil)
 
-        # 5. Resize to exact target dimensions
+        # 5. Resize to exact passport dimensions with LANCZOS antialiasing
         resized_pil = white_bg_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
         
         # 6. Compress cleanly under target KB limit
@@ -79,7 +87,7 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        print(f"⚡ Processed {specs['name']} in {round(time.time() - t0, 3)} seconds!", flush=True)
+        print(f"✨ Studio processing done in {round(time.time() - t0, 2)}s", flush=True)
 
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_pil
         gc.collect()
@@ -97,7 +105,7 @@ class PhotoProcessor:
             return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(35, 35))
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
         if len(faces) == 0:
             return {"face_found": False, "face_height_ratio": 0}
         
@@ -143,56 +151,24 @@ class PhotoProcessor:
 
         return pil_image.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
 
-    def _apply_studio_white_background(self, pil_image):
-        """Precision geometric foreground-seeded GrabCut with alpha feathering (0.05s)"""
+    def _replace_background_studio(self, pil_image):
+        """Clean Neural Network Cutout + Pure Solid White Canvas"""
         try:
-            cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-            h, w = cv_img.shape[:2]
+            img_byte_arr = io.BytesIO()
+            # Fast PNG compression for instant transfer
+            pil_image.save(img_byte_arr, format="PNG", compress_level=1)
             
-            mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+            # Neural AI Matting
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=ai_session)
+            removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
-            # 1. Definite Background: Upper corners above shoulders
-            top_h = max(1, int(h * 0.15))
-            mask[0:top_h, :] = cv2.GC_BGD
-            side_w = max(1, int(w * 0.18))
-            mask[0:int(h * 0.55), 0:side_w] = cv2.GC_BGD
-            mask[0:int(h * 0.55), w - side_w:w] = cv2.GC_BGD
-            
-            # 2. Definite Foreground: Centered Head Ellipse
-            head_cx = int(w * 0.5)
-            head_cy = int(h * 0.40)
-            head_rx = int(w * 0.26)
-            head_ry = int(h * 0.26)
-            cv2.ellipse(mask, (head_cx, head_cy), (head_rx, head_ry), 0, 0, 360, cv2.GC_FGD, -1)
-            
-            # 3. Definite Foreground: Torso Trapezoid
-            neck_w = int(w * 0.35)
-            torso_pts = np.array([
-                [head_cx - neck_w, int(h * 0.60)],
-                [head_cx + neck_w, int(h * 0.60)],
-                [w, h],
-                [0, h]
-            ], dtype=np.int32)
-            cv2.fillPoly(mask, [torso_pts], cv2.GC_FGD)
-            
-            # 4. Fast GrabCut Solver
-            bgdModel = np.zeros((1, 65), np.float64)
-            fgdModel = np.zeros((1, 65), np.float64)
-            cv2.grabCut(cv_img, mask, None, bgdModel, fgdModel, 4, cv2.GC_INIT_WITH_MASK)
-            
-            # 5. Extract & Feather Mask (Smooth studio edges)
-            fg_mask = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype('uint8')
-            fg_mask = cv2.GaussianBlur(fg_mask, (7, 7), 0)
-            alpha = (fg_mask.astype(np.float32) / 255.0)[:, :, np.newaxis]
-            
-            # 6. Composite over Pure White (255, 255, 255)
-            white_bg = np.full_like(cv_img, 255, dtype=np.uint8)
-            result = (cv_img * alpha + white_bg * (1.0 - alpha)).astype(np.uint8)
-            
-            return Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
+            # Solid White Base
+            white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
+            white_bg.paste(removed_bg, mask=removed_bg.split()[3])
+            return white_bg.convert("RGB")
         except Exception as e:
             print(f"[Studio Background Error] {e}", flush=True)
-            return pil_image
+            return pil_image.convert("RGB")
 
     def _compress_image(self, pil_image, max_size_kb):
         quality = 95
