@@ -1,10 +1,12 @@
-import os, io, gc, urllib.request, base64
+import os, io, gc, base64, time
 import numpy as np
 import cv2
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
 from PIL import Image, ImageOps
+import onnxruntime as ort
+from rembg import remove, new_session
 from duckduckgo_search import DDGS
 from groq import Groq
 from flask import Flask, request, jsonify
@@ -12,36 +14,17 @@ from flask_cors import CORS
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# 1. Lazy Globals (Do NOT load on startup so port opens in 0.01s)
-face_cascade = None
-rembg_session = None
+# 1. OpenCV Built-in Face Detector (Instant, zero network download)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-def get_face_cascade():
-    global face_cascade
-    if face_cascade is None:
-        cascade_path = "haarcascade_frontalface_default.xml"
-        if not os.path.exists(cascade_path):
-            try:
-                urllib.request.urlretrieve(
-                    "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
-                    cascade_path
-                )
-            except Exception as e:
-                print(f"Cascade error: {e}")
-        try:
-            face_cascade = cv2.CascadeClassifier(cascade_path)
-        except Exception:
-            face_cascade = None
-    return face_cascade
+# 2. Optimized Single-Threaded AI Session (Prevents CPU thread locking)
+sess_opts = ort.SessionOptions()
+sess_opts.intra_op_num_threads = 1
+sess_opts.inter_op_num_threads = 1
+sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+rembg_session = new_session("u2netp", session_options=sess_opts)
 
-def get_rembg_session():
-    global rembg_session
-    if rembg_session is None:
-        from rembg import new_session
-        rembg_session = new_session("u2netp")
-    return rembg_session
-
-# 2. Form Specifications
+# 3. Government Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -52,17 +35,19 @@ FORM_SPECS = {
 
 class PhotoProcessor:
     def process(self, image_bytes, form_id):
+        t0 = time.time()
         if form_id not in FORM_SPECS:
             return {"success": False, "error": f"Unknown form: {form_id}"}
 
         specs = FORM_SPECS[form_id]
         
-        # 1. Load image and correct smartphone orientation
+        # 1. Load image and correct smartphone rotation
         raw_pil = Image.open(io.BytesIO(image_bytes))
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        original_pil.thumbnail((1200, 1200), Image.LANCZOS)
+        # Scale to max 800px for lightning-fast facial geometry detection
+        original_pil.thumbnail((800, 800), Image.LANCZOS)
         original_np = np.array(original_pil)
 
         # 2. Detect face
@@ -76,17 +61,17 @@ class PhotoProcessor:
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop with exact government ratio
+        # 3. Crop face with government ratio
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Resize to target dimensions
+        # 4. Resize to target dimensions FIRST (e.g. 413x531)
         resized_temp = cropped_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
 
-        # 5. Studio-Grade AI Background Removal with White Backdrop
+        # 5. Studio-Grade AI Background Removal with Solid White Matte
         white_bg_pil = self._replace_background_ai(resized_temp)
         
         # 6. Compress cleanly under target KB limit
@@ -99,7 +84,8 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        # Cleanup memory
+        print(f"[PhotoProcessor] Processed {specs['name']} in {round(time.time() - t0, 2)}s")
+
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_temp
         gc.collect()
 
@@ -111,13 +97,12 @@ class PhotoProcessor:
         }
 
     def _detect_face(self, image_np):
-        cascade = get_face_cascade()
-        if cascade is None or cascade.empty():
+        if face_cascade.empty():
             h, w = image_np.shape[:2]
             return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
         if len(faces) == 0:
             return {"face_found": False, "face_height_ratio": 0}
         
@@ -165,19 +150,17 @@ class PhotoProcessor:
 
     def _replace_background_ai(self, pil_image):
         try:
-            from rembg import remove
-            session = get_rembg_session()
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format="PNG")
             
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=session)
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
             removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
             white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
             white_bg.paste(removed_bg, mask=removed_bg.split()[3])
             return white_bg.convert("RGB")
         except Exception as e:
-            print(f"AI background error: {e}")
+            print(f"[Background AI Error] {e}")
             return pil_image.convert("RGB")
 
     def _compress_image(self, pil_image, max_size_kb):
