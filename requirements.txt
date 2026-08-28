@@ -2,10 +2,12 @@ flask
 flask-cors
 gunicorn
 requests
-opencv-python-headless==4.10.0.84
+opencv-python-headless
 Pillow
 groq
 duckduckgo-search
 trafilatura
 beautifulsoup4
 numpy
+rembg
+onnxruntime
