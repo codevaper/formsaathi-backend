@@ -9,3 +9,5 @@ duckduckgo-search
 trafilatura
 beautifulsoup4
 numpy
+rembg[cpu]
+onnxruntime
