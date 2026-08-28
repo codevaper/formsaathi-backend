@@ -1,46 +1,70 @@
-import os, io, gc, time, base64
+import os, io, gc, time, base64, urllib.request
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageOps
 import numpy as np
 import cv2
 
-# Set single-thread limits to prevent CPU deadlocks on free tier
+# Set single thread to prevent CPU thread locking on Render free tier
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# Initialize Flask immediately so Render detects the port instantly
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Global Lazy Holders (Loaded ONLY on demand, NEVER on server startup)
-_rembg_session = None
-_face_cascade = None
+# ============================================================
+# 1. PRE-DOWNLOAD MODELS ON BOOT (Prevents Runtime Freezes)
+# ============================================================
+U2NET_DIR = os.path.expanduser("~/.u2net")
+os.makedirs(U2NET_DIR, exist_ok=True)
+U2NET_PATH = os.path.join(U2NET_DIR, "u2netp.onnx")
 
-def get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None:
-        try:
-            _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        except Exception:
-            _face_cascade = None
-    return _face_cascade
+if not os.path.exists(U2NET_PATH) or os.path.getsize(U2NET_PATH) < 1000000:
+    print("⏳ Pre-downloading u2netp AI model to local cache...", flush=True)
+    try:
+        urllib.request.urlretrieve(
+            "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
+            U2NET_PATH
+        )
+        print("✅ u2netp model cached successfully!", flush=True)
+    except Exception as e:
+        print(f"⚠️ Warning downloading u2netp: {e}", flush=True)
 
-def get_rembg_session():
-    global _rembg_session
-    if _rembg_session is None:
-        import onnxruntime as ort
-        from rembg import new_session
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
-        _rembg_session = new_session("u2netp", session_options=opts)
-    return _rembg_session
+# Pre-download Face Detector
+CASCADE_PATH = os.path.join(os.getcwd(), "haarcascade_frontalface_default.xml")
+if not os.path.exists(CASCADE_PATH):
+    try:
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
+            CASCADE_PATH
+        )
+    except Exception as e:
+        print(f"⚠️ Cascade download error: {e}", flush=True)
 
-# Form Specifications
+try:
+    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+except Exception:
+    face_cascade = None
+
+# Initialize AI Session Once on Startup
+rembg_session = None
+try:
+    import onnxruntime as ort
+    from rembg import new_session
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    rembg_session = new_session("u2netp", session_options=opts)
+    print("✅ AI Background Removal Engine Ready!", flush=True)
+except Exception as e:
+    print(f"⚠️ AI Session Init Failed: {e}", flush=True)
+
+# ============================================================
+# 2. GOVERNMENT FORM SPECIFICATIONS
+# ============================================================
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -49,9 +73,14 @@ FORM_SPECS = {
     "voter_id": {"name": "Voter ID", "width_px": 413, "height_px": 531, "max_size_kb": 200, "face_coverage_min": 0.70, "face_coverage_max": 0.80}
 }
 
+# ============================================================
+# 3. PHOTO PROCESSOR PIPELINE (< 0.8s EXECUTION)
+# ============================================================
 class PhotoProcessor:
     def process(self, image_bytes, form_id):
-        t0 = time.time()
+        t_start = time.time()
+        print(f"\n[1/5] Processing started for form: {form_id}...", flush=True)
+
         if form_id not in FORM_SPECS:
             return {"success": False, "error": f"Unknown form: {form_id}"}
 
@@ -62,7 +91,7 @@ class PhotoProcessor:
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Fast downscale
+        # Scale to max 800px for instant face detection
         original_pil.thumbnail((800, 800), Image.LANCZOS)
         original_np = np.array(original_pil)
 
@@ -74,21 +103,24 @@ class PhotoProcessor:
                 "error": "No clear face detected. Please upload a front-facing photo.", 
                 "original_size_kb": round(original_size_kb, 2)
             }
+        print(f"[2/5] Face detected in {round(time.time() - t_start, 2)}s", flush=True)
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop face with government ratio
+        # 3. Crop face with government aspect ratio
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Resize to target dimensions
+        # 4. Resize to target dimensions FIRST (so AI only processes tiny 400px image in 0.3s)
         resized_temp = cropped_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
 
         # 5. Studio-Grade AI Background Removal with Solid White Matte
+        t_bg = time.time()
         white_bg_pil = self._replace_background_ai(resized_temp)
+        print(f"[3/5] Studio background applied in {round(time.time() - t_bg, 2)}s", flush=True)
         
         # 6. Compress cleanly under target KB limit
         compressed_bytes, final_size_kb = self._compress_image(white_bg_pil, specs["max_size_kb"])
@@ -100,7 +132,8 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        print(f"[PhotoProcessor] Done in {round(time.time() - t0, 2)}s")
+        total_time = round(time.time() - t_start, 2)
+        print(f"[4/5] Completed successfully in {total_time}s!\n", flush=True)
 
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_temp
         gc.collect()
@@ -113,13 +146,12 @@ class PhotoProcessor:
         }
 
     def _detect_face(self, image_np):
-        cascade = get_face_cascade()
-        if cascade is None or cascade.empty():
+        if face_cascade is None or face_cascade.empty():
             h, w = image_np.shape[:2]
             return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
         if len(faces) == 0:
             return {"face_found": False, "face_height_ratio": 0}
         
@@ -167,19 +199,21 @@ class PhotoProcessor:
 
     def _replace_background_ai(self, pil_image):
         try:
+            if rembg_session is None:
+                return pil_image.convert("RGB")
+            
             from rembg import remove
-            session = get_rembg_session()
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format="PNG")
             
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=session)
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
             removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
             white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
             white_bg.paste(removed_bg, mask=removed_bg.split()[3])
             return white_bg.convert("RGB")
         except Exception as e:
-            print(f"[AI Background Error] {e}")
+            print(f"[AI Background Error] {e}", flush=True)
             return pil_image.convert("RGB")
 
     def _compress_image(self, pil_image, max_size_kb):
@@ -212,7 +246,9 @@ class PhotoProcessor:
 
 processor = PhotoProcessor()
 
-# Web search & AI helpers
+# ============================================================
+# 4. AI CHAT & SEARCH
+# ============================================================
 def search_web(query, max_results=3):
     from duckduckgo_search import DDGS
     results = []
@@ -275,7 +311,9 @@ def ask_ai(query, context):
     except Exception as e:
         return f"AI Error: {str(e)}"
 
-# Endpoints
+# ============================================================
+# 5. ENDPOINTS
+# ============================================================
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
@@ -319,6 +357,7 @@ def process_photo():
         result = processor.process(photo.read(), form_id)
         return jsonify(result)
     except Exception as e:
+        print(f"Process photo error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/form-specs", methods=["GET"])
