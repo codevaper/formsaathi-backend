@@ -1,6 +1,7 @@
 flask
 flask-cors
 gunicorn
+requests
 opencv-python-headless
 Pillow
 groq
