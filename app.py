@@ -12,59 +12,42 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
+# 1. Flask App (Starts instantly in 0.01s so Render port check passes immediately)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ============================================================
-# 1. PRE-DOWNLOAD MODELS ON BOOT (Prevents Runtime Freezes)
-# ============================================================
-U2NET_DIR = os.path.expanduser("~/.u2net")
-os.makedirs(U2NET_DIR, exist_ok=True)
-U2NET_PATH = os.path.join(U2NET_DIR, "u2netp.onnx")
+# Global Lazy AI Instances (Loaded ONLY on first photo upload)
+_face_cascade = None
+_rembg_session = None
 
-if not os.path.exists(U2NET_PATH) or os.path.getsize(U2NET_PATH) < 1000000:
-    print("⏳ Pre-downloading u2netp AI model to local cache...", flush=True)
-    try:
-        urllib.request.urlretrieve(
-            "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx",
-            U2NET_PATH
-        )
-        print("✅ u2netp model cached successfully!", flush=True)
-    except Exception as e:
-        print(f"⚠️ Warning downloading u2netp: {e}", flush=True)
+def get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        try:
+            cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            _face_cascade = cv2.CascadeClassifier(cascade_path)
+        except Exception:
+            _face_cascade = None
+    return _face_cascade
 
-# Pre-download Face Detector
-CASCADE_PATH = os.path.join(os.getcwd(), "haarcascade_frontalface_default.xml")
-if not os.path.exists(CASCADE_PATH):
-    try:
-        urllib.request.urlretrieve(
-            "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
-            CASCADE_PATH
-        )
-    except Exception as e:
-        print(f"⚠️ Cascade download error: {e}", flush=True)
+def get_rembg_session():
+    global _rembg_session
+    if _rembg_session is None:
+        try:
+            import onnxruntime as ort
+            from rembg import new_session
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = 1
+            opts.inter_op_num_threads = 1
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            # u2netp is only 4MB and ultra-fast
+            _rembg_session = new_session("u2netp", session_options=opts)
+        except Exception as e:
+            print(f"[Lazy Load rembg Error] {e}", flush=True)
+            _rembg_session = "FAILED"
+    return _rembg_session
 
-try:
-    face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-except Exception:
-    face_cascade = None
-
-# Initialize AI Session Once on Startup
-rembg_session = None
-try:
-    import onnxruntime as ort
-    from rembg import new_session
-    opts = ort.SessionOptions()
-    opts.intra_op_num_threads = 1
-    opts.inter_op_num_threads = 1
-    rembg_session = new_session("u2netp", session_options=opts)
-    print("✅ AI Background Removal Engine Ready!", flush=True)
-except Exception as e:
-    print(f"⚠️ AI Session Init Failed: {e}", flush=True)
-
-# ============================================================
-# 2. GOVERNMENT FORM SPECIFICATIONS
-# ============================================================
+# Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -73,14 +56,9 @@ FORM_SPECS = {
     "voter_id": {"name": "Voter ID", "width_px": 413, "height_px": 531, "max_size_kb": 200, "face_coverage_min": 0.70, "face_coverage_max": 0.80}
 }
 
-# ============================================================
-# 3. PHOTO PROCESSOR PIPELINE (< 0.8s EXECUTION)
-# ============================================================
 class PhotoProcessor:
     def process(self, image_bytes, form_id):
-        t_start = time.time()
-        print(f"\n[1/5] Processing started for form: {form_id}...", flush=True)
-
+        t0 = time.time()
         if form_id not in FORM_SPECS:
             return {"success": False, "error": f"Unknown form: {form_id}"}
 
@@ -91,7 +69,7 @@ class PhotoProcessor:
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Scale to max 800px for instant face detection
+        # Downscale large images to max 800px for speed
         original_pil.thumbnail((800, 800), Image.LANCZOS)
         original_np = np.array(original_pil)
 
@@ -103,7 +81,6 @@ class PhotoProcessor:
                 "error": "No clear face detected. Please upload a front-facing photo.", 
                 "original_size_kb": round(original_size_kb, 2)
             }
-        print(f"[2/5] Face detected in {round(time.time() - t_start, 2)}s", flush=True)
 
         original_coverage = face_info["face_height_ratio"]
         
@@ -114,13 +91,11 @@ class PhotoProcessor:
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Resize to target dimensions FIRST (so AI only processes tiny 400px image in 0.3s)
+        # 4. Resize to target dimensions FIRST
         resized_temp = cropped_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
 
         # 5. Studio-Grade AI Background Removal with Solid White Matte
-        t_bg = time.time()
         white_bg_pil = self._replace_background_ai(resized_temp)
-        print(f"[3/5] Studio background applied in {round(time.time() - t_bg, 2)}s", flush=True)
         
         # 6. Compress cleanly under target KB limit
         compressed_bytes, final_size_kb = self._compress_image(white_bg_pil, specs["max_size_kb"])
@@ -132,8 +107,7 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        total_time = round(time.time() - t_start, 2)
-        print(f"[4/5] Completed successfully in {total_time}s!\n", flush=True)
+        print(f"[PhotoProcessor] Processed {specs['name']} in {round(time.time() - t0, 2)}s", flush=True)
 
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_temp
         gc.collect()
@@ -146,12 +120,13 @@ class PhotoProcessor:
         }
 
     def _detect_face(self, image_np):
-        if face_cascade is None or face_cascade.empty():
+        cascade = get_face_cascade()
+        if cascade is None or cascade.empty():
             h, w = image_np.shape[:2]
             return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
         if len(faces) == 0:
             return {"face_found": False, "face_height_ratio": 0}
         
@@ -199,21 +174,22 @@ class PhotoProcessor:
 
     def _replace_background_ai(self, pil_image):
         try:
-            if rembg_session is None:
+            session = get_rembg_session()
+            if session == "FAILED" or session is None:
                 return pil_image.convert("RGB")
-            
+
             from rembg import remove
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format="PNG")
             
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=session)
             removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
             white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
             white_bg.paste(removed_bg, mask=removed_bg.split()[3])
             return white_bg.convert("RGB")
         except Exception as e:
-            print(f"[AI Background Error] {e}", flush=True)
+            print(f"[Background Error] {e}", flush=True)
             return pil_image.convert("RGB")
 
     def _compress_image(self, pil_image, max_size_kb):
@@ -246,9 +222,6 @@ class PhotoProcessor:
 
 processor = PhotoProcessor()
 
-# ============================================================
-# 4. AI CHAT & SEARCH
-# ============================================================
 def search_web(query, max_results=3):
     from duckduckgo_search import DDGS
     results = []
@@ -285,85 +258,4 @@ def ask_ai(query, context):
         if not GROQ_API_KEY:
             return "Please configure your GROQ_API_KEY in Render."
         client = Groq(api_key=GROQ_API_KEY.strip())
-        all_models = client.models.list().data
-        chat_candidates = [
-            m.id for m in all_models 
-            if not any(bad in m.id.lower() for bad in ["whisper", "guard", "audio", "embed", "orpheus", "vision"])
-        ]
-        for model_id in chat_candidates:
-            try:
-                response = client.chat.completions.create(
-                    model=model_id,
-                    messages=[
-                        {"role": "system", "content": "You are FormSaathi AI, an Indian government scheme and document assistant. Provide clear, concise answers with source citations."},
-                        {"role": "user", "content": f"WEB CONTEXT:\n{context}\n\nUSER QUESTION: {query}"}
-                    ],
-                    temperature=0.2,
-                    max_tokens=800
-                )
-                return response.choices[0].message.content
-            except Exception:
-                continue
-
-        if context:
-            return f"**Information Found:**\n\n" + context[:1000] + "..."
-        return "No specific details found."
-    except Exception as e:
-        return f"AI Error: {str(e)}"
-
-# ============================================================
-# 5. ENDPOINTS
-# ============================================================
-@app.route("/", methods=["GET", "HEAD"])
-def home():
-    return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
-
-@app.route("/ask", methods=["POST"])
-def ask():
-    try:
-        data = request.get_json(force=True)
-        query = data.get("query", "").strip()
-        if not query:
-            return jsonify({"error": "Missing query parameter"}), 400
-        
-        search_results = search_web(query, max_results=3)
-        all_context, sources = [], []
-        for r in search_results:
-            text = scrape_url(r["url"])
-            if text:
-                all_context.append(f"[{r['title']}] ({r['url']})\n{text}")
-                sources.append({"title": r["title"], "url": r["url"]})
-        
-        if not all_context:
-            all_context = [f"[{r['title']}] {r['snippet']}" for r in search_results]
-            sources = [{"title": r["title"], "url": r["url"]} for r in search_results]
-
-        answer = ask_ai(query, "\n\n---\n\n".join(all_context))
-        return jsonify({"success": True, "answer": answer, "sources": sources})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/process-photo", methods=["POST"])
-def process_photo():
-    try:
-        if "photo" not in request.files or "form_id" not in request.form:
-            return jsonify({"error": "Missing 'photo' or 'form_id'"}), 400
-        photo = request.files["photo"]
-        form_id = request.form["form_id"]
-        result = processor.process(photo.read(), form_id)
-        return jsonify(result)
-    except Exception as e:
-        print(f"Process photo error: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/form-specs", methods=["GET"])
-def form_specs():
-    return jsonify({"success": True, "forms": FORM_SPECS})
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+        all_models 
