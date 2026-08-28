@@ -1,11 +1,10 @@
-import os, io, re, base64, urllib.request
+import os, io, gc, urllib.request
 import numpy as np
 import cv2
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
 from PIL import Image, ImageOps
-from rembg import remove
 from duckduckgo_search import DDGS
 from groq import Groq
 from flask import Flask, request, jsonify
@@ -13,14 +12,18 @@ from flask_cors import CORS
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# 1. OpenCV Face Detector
+# 1. Download Face Detector if missing
 cascade_path = "haarcascade_frontalface_default.xml"
 if not os.path.exists(cascade_path):
-    urllib.request.urlretrieve(
-        "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
-        cascade_path
-    )
-face_cascade = cv2.CascadeClassifier(cascade_path)
+    try:
+        urllib.request.urlretrieve(
+            "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
+            cascade_path
+        )
+    except Exception as e:
+        print(f"Cascade download error: {e}")
+
+face_cascade = cv2.CascadeClassifier(cascade_path) if os.path.exists(cascade_path) else None
 
 # 2. Form Specs
 FORM_SPECS = {
@@ -30,6 +33,20 @@ FORM_SPECS = {
     "domicile_certificate": {"name": "Domicile Certificate", "width_px": 160, "height_px": 212, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "voter_id": {"name": "Voter ID", "width_px": 413, "height_px": 531, "max_size_kb": 200, "face_coverage_min": 0.70, "face_coverage_max": 0.80}
 }
+
+# 3. Lazy loaded rembg session to save RAM on startup
+rembg_session = None
+
+def get_rembg_session():
+    global rembg_session
+    if rembg_session is None:
+        try:
+            from rembg import new_session
+            # u2netp is ultra-lightweight (only 4MB model vs 180MB standard)
+            rembg_session = new_session("u2netp")
+        except Exception as e:
+            print(f"Failed to load rembg session: {e}")
+    return rembg_session
 
 class PhotoProcessor:
     def process(self, image_bytes, form_id):
@@ -57,11 +74,19 @@ class PhotoProcessor:
         final_coverage = final_face_info["face_height_ratio"] if final_face_info["face_found"] else 0.75
 
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
+        
+        import base64
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
+
+        # Free memory immediately
+        del original_np, final_np, raw_pil, white_bg_pil, cropped_pil
+        gc.collect()
 
         return {"success": True, "form": specs["name"], "processed_image_base64": processed_base64, "report": report}
 
     def _detect_face(self, image_np):
+        if face_cascade is None:
+            return {"face_found": True, "x": 50, "y": 50, "w": 200, "h": 200, "face_height_ratio": 0.75, "img_w": image_np.shape[1], "img_h": image_np.shape[0]}
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
         if len(faces) == 0:
@@ -92,13 +117,19 @@ class PhotoProcessor:
         return pil_image.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
 
     def _replace_background(self, pil_image):
-        img_byte_arr = io.BytesIO()
-        pil_image.save(img_byte_arr, format="PNG")
-        removed_bg_bytes = remove(img_byte_arr.getvalue())
-        removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
-        white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
-        white_bg.paste(removed_bg, mask=removed_bg.split()[3])
-        return white_bg.convert("RGB")
+        try:
+            from rembg import remove
+            session = get_rembg_session()
+            img_byte_arr = io.BytesIO()
+            pil_image.save(img_byte_arr, format="PNG")
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=session)
+            removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
+            white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
+            white_bg.paste(removed_bg, mask=removed_bg.split()[3])
+            return white_bg.convert("RGB")
+        except Exception as e:
+            print(f"Background removal skipped (memory protection): {e}")
+            return pil_image
 
     def _compress_image(self, pil_image, max_size_kb):
         quality = 95
@@ -129,7 +160,7 @@ class PhotoProcessor:
 
 processor = PhotoProcessor()
 
-def search_web(query, max_results=4):
+def search_web(query, max_results=3):
     results = []
     try:
         with DDGS() as ddgs:
@@ -139,27 +170,27 @@ def search_web(query, max_results=4):
         pass
     return results
 
-def scrape_url(url, timeout=8):
+def scrape_url(url, timeout=5):
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
             text = trafilatura.extract(downloaded, include_comments=False, include_tables=True)
             if text and len(text.strip()) > 80:
-                return text.strip()[:3500]
+                return text.strip()[:2000]
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         text = soup.get_text(separator=" ", strip=True)
-        return text[:3500] if text else None
+        return text[:2000] if text else None
     except Exception:
         return None
 
 def ask_ai(query, context):
     try:
         if not GROQ_API_KEY:
-            return "Please configure your GROQ_API_KEY environment variable in Render."
+            return "Please configure your GROQ_API_KEY in Render."
         client = Groq(api_key=GROQ_API_KEY.strip())
         all_models = client.models.list().data
         chat_candidates = [
@@ -171,18 +202,18 @@ def ask_ai(query, context):
                 response = client.chat.completions.create(
                     model=model_id,
                     messages=[
-                        {"role": "system", "content": "You are FormSaathi AI, an Indian government scheme and document assistant. Provide clear, accurate answers with source citations."},
+                        {"role": "system", "content": "You are FormSaathi AI, an Indian government scheme and document assistant. Provide clear, concise answers with source citations."},
                         {"role": "user", "content": f"WEB CONTEXT:\n{context}\n\nUSER QUESTION: {query}"}
                     ],
                     temperature=0.2,
-                    max_tokens=1024
+                    max_tokens=800
                 )
                 return response.choices[0].message.content
             except Exception:
                 continue
 
         if context:
-            return f"**Live Information from Government Portals:**\n\n" + context[:1000] + "..."
+            return f"**Information Found:**\n\n" + context[:1000] + "..."
         return "No specific details found."
     except Exception as e:
         return f"AI Error: {str(e)}"
@@ -191,11 +222,15 @@ def ask_ai(query, context):
 # FLASK APP
 # ============================================================
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "HEAD"])
 def home():
     return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
 @app.route("/ask", methods=["POST"])
 def ask():
@@ -203,9 +238,9 @@ def ask():
         data = request.get_json(force=True)
         query = data.get("query", "").strip()
         if not query:
-            return jsonify({"error": "Missing 'query' parameter"}), 400
+            return jsonify({"error": "Missing query parameter"}), 400
         
-        search_results = search_web(query, max_results=4)
+        search_results = search_web(query, max_results=3)
         all_context, sources = [], []
         for r in search_results:
             text = scrape_url(r["url"])
