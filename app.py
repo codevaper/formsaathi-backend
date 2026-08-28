@@ -1,4 +1,4 @@
-import os, io, base64, urllib.request
+import os, io, re, base64, urllib.request
 import numpy as np
 import cv2
 import requests
@@ -8,15 +8,12 @@ from PIL import Image, ImageOps
 from rembg import remove
 from duckduckgo_search import DDGS
 from groq import Groq
-import gradio as gr
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# 🔑 Groq API Key
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "gsk_PASTE_YOUR_GROQ_KEY_HERE")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# Download OpenCV Face Classifier
+# 1. OpenCV Face Detector
 cascade_path = "haarcascade_frontalface_default.xml"
 if not os.path.exists(cascade_path):
     urllib.request.urlretrieve(
@@ -25,6 +22,7 @@ if not os.path.exists(cascade_path):
     )
 face_cascade = cv2.CascadeClassifier(cascade_path)
 
+# 2. Form Specs
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -160,6 +158,8 @@ def scrape_url(url, timeout=8):
 
 def ask_ai(query, context):
     try:
+        if not GROQ_API_KEY:
+            return "Please configure your GROQ_API_KEY environment variable in Render."
         client = Groq(api_key=GROQ_API_KEY.strip())
         all_models = client.models.list().data
         chat_candidates = [
@@ -182,57 +182,62 @@ def ask_ai(query, context):
                 continue
 
         if context:
-            return f"**Live Information:**\n\n" + context[:1000] + "..."
-        return "No information found."
+            return f"**Live Information from Government Portals:**\n\n" + context[:1000] + "..."
+        return "No specific details found."
     except Exception as e:
         return f"AI Error: {str(e)}"
 
 # ============================================================
-# FASTAPI APP
+# FLASK APP
 # ============================================================
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
+CORS(app)
 
-@app.post("/ask")
-async def ask_endpoint(payload: dict):
-    query = payload.get("query", "").strip()
-    if not query:
-        return JSONResponse(content={"error": "Missing query"}, status_code=400)
-    search_results = search_web(query, max_results=4)
-    all_context, sources = [], []
-    for r in search_results:
-        text = scrape_url(r["url"])
-        if text:
-            all_context.append(f"[{r['title']}] ({r['url']})\n{text}")
-            sources.append({"title": r["title"], "url": r["url"]})
-    if not all_context:
-        all_context = [f"[{r['title']}] {r['snippet']}" for r in search_results]
-        sources = [{"title": r["title"], "url": r["url"]} for r in search_results]
-    answer = ask_ai(query, "\n\n---\n\n".join(all_context))
-    return {"success": True, "answer": answer, "sources": sources}
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
 
-@app.post("/process-photo")
-async def process_photo_endpoint(photo: UploadFile = File(...), form_id: str = Form(...)):
-    contents = await photo.read()
-    result = processor.process(contents, form_id)
-    return result
+@app.route("/ask", methods=["POST"])
+def ask():
+    try:
+        data = request.get_json(force=True)
+        query = data.get("query", "").strip()
+        if not query:
+            return jsonify({"error": "Missing 'query' parameter"}), 400
+        
+        search_results = search_web(query, max_results=4)
+        all_context, sources = [], []
+        for r in search_results:
+            text = scrape_url(r["url"])
+            if text:
+                all_context.append(f"[{r['title']}] ({r['url']})\n{text}")
+                sources.append({"title": r["title"], "url": r["url"]})
+        
+        if not all_context:
+            all_context = [f"[{r['title']}] {r['snippet']}" for r in search_results]
+            sources = [{"title": r["title"], "url": r["url"]} for r in search_results]
 
-@app.get("/form-specs")
-async def form_specs_endpoint():
-    return {"success": True, "forms": FORM_SPECS}
+        answer = ask_ai(query, "\n\n---\n\n".join(all_context))
+        return jsonify({"success": True, "answer": answer, "sources": sources})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# Mount Gradio for Hugging Face health check UI
-with gr.Blocks() as demo:
-    gr.Markdown("# 🚀 FormSaathi 24/7 API Backend Running!")
-    gr.Markdown("Direct endpoints available: `/ask`, `/process-photo`, `/form-specs`")
+@app.route("/process-photo", methods=["POST"])
+def process_photo():
+    try:
+        if "photo" not in request.files or "form_id" not in request.form:
+            return jsonify({"error": "Missing 'photo' or 'form_id'"}), 400
+        photo = request.files["photo"]
+        form_id = request.form["form_id"]
+        result = processor.process(photo.read(), form_id)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-app = gr.mount_gradio_app(app, demo, path="/")
+@app.route("/form-specs", methods=["GET"])
+def form_specs():
+    return jsonify({"success": True, "forms": FORM_SPECS})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
