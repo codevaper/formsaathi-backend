@@ -5,7 +5,6 @@ import requests
 import trafilatura
 from bs4 import BeautifulSoup
 from PIL import Image, ImageOps
-from rembg import remove, new_session
 from duckduckgo_search import DDGS
 from groq import Groq
 from flask import Flask, request, jsonify
@@ -13,27 +12,36 @@ from flask_cors import CORS
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# 1. Download OpenCV Face Detector
-cascade_path = "haarcascade_frontalface_default.xml"
-if not os.path.exists(cascade_path):
-    try:
-        urllib.request.urlretrieve(
-            "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
-            cascade_path
-        )
-    except Exception as e:
-        print(f"Cascade download error: {e}")
+# 1. Lazy Globals (Do NOT load on startup so port opens in 0.01s)
+face_cascade = None
+rembg_session = None
 
-try:
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-except Exception as e:
-    face_cascade = None
+def get_face_cascade():
+    global face_cascade
+    if face_cascade is None:
+        cascade_path = "haarcascade_frontalface_default.xml"
+        if not os.path.exists(cascade_path):
+            try:
+                urllib.request.urlretrieve(
+                    "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml",
+                    cascade_path
+                )
+            except Exception as e:
+                print(f"Cascade error: {e}")
+        try:
+            face_cascade = cv2.CascadeClassifier(cascade_path)
+        except Exception:
+            face_cascade = None
+    return face_cascade
 
-# 2. Initialize Ultra-Lightweight Studio AI Model (u2netp: only 4.7MB)
-# Produces crisp, professional hair and shoulder segmentation
-rembg_session = new_session("u2netp")
+def get_rembg_session():
+    global rembg_session
+    if rembg_session is None:
+        from rembg import new_session
+        rembg_session = new_session("u2netp")
+    return rembg_session
 
-# 3. Government Form Specifications
+# 2. Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -54,7 +62,6 @@ class PhotoProcessor:
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Standardize working resolution
         original_pil.thumbnail((1200, 1200), Image.LANCZOS)
         original_np = np.array(original_pil)
 
@@ -69,18 +76,17 @@ class PhotoProcessor:
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop with exact government aspect ratio and centered head
+        # 3. Crop with exact government ratio
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Resize to target dimensions FIRST (e.g. 413x531)
-        # This makes rembg process in < 1 second with studio quality
+        # 4. Resize to target dimensions
         resized_temp = cropped_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
 
-        # 5. Studio-Grade AI Background Removal with Solid White Matte
+        # 5. Studio-Grade AI Background Removal with White Backdrop
         white_bg_pil = self._replace_background_ai(resized_temp)
         
         # 6. Compress cleanly under target KB limit
@@ -93,7 +99,7 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        # Free memory
+        # Cleanup memory
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_temp
         gc.collect()
 
@@ -105,12 +111,13 @@ class PhotoProcessor:
         }
 
     def _detect_face(self, image_np):
-        if face_cascade is None or face_cascade.empty():
+        cascade = get_face_cascade()
+        if cascade is None or cascade.empty():
             h, w = image_np.shape[:2]
             return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
         if len(faces) == 0:
             return {"face_found": False, "face_height_ratio": 0}
         
@@ -127,7 +134,7 @@ class PhotoProcessor:
         img_w, img_h = face_info["img_w"], face_info["img_h"]
         face_x, face_y, face_w, face_h = face_info["x"], face_info["y"], face_info["w"], face_info["h"]
 
-        target_coverage = (min_cov + max_cov) / 2.0  # 75%
+        target_coverage = (min_cov + max_cov) / 2.0
         target_aspect = target_w / target_h
 
         head_cx = face_x + face_w / 2.0
@@ -157,21 +164,20 @@ class PhotoProcessor:
         return pil_image.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
 
     def _replace_background_ai(self, pil_image):
-        """Studio-grade AI segmentation with crisp alpha compositing"""
         try:
+            from rembg import remove
+            session = get_rembg_session()
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format="PNG")
             
-            # Neural network segmentation
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=session)
             removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
-            # Paste over clean, solid white backdrop
             white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
             white_bg.paste(removed_bg, mask=removed_bg.split()[3])
             return white_bg.convert("RGB")
         except Exception as e:
-            print(f"AI background error, using fallback: {e}")
+            print(f"AI background error: {e}")
             return pil_image.convert("RGB")
 
     def _compress_image(self, pil_image, max_size_kb):
