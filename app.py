@@ -4,10 +4,9 @@ from flask_cors import CORS
 from PIL import Image, ImageOps
 import numpy as np
 import cv2
-import onnxruntime as ort
 from rembg import remove, new_session
 
-# Single-thread limits for CPU efficiency
+# Single-thread limits to prevent CPU deadlocks on cloud hosting
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -18,16 +17,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 2. Load OpenCV Face Detector
+# 2. OpenCV Face Detector
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-# 3. Load Studio AI Background Session (Pre-cached from build step)
-sess_opts = ort.SessionOptions()
-sess_opts.intra_op_num_threads = 1
-sess_opts.inter_op_num_threads = 1
-ai_session = new_session("u2netp", session_options=sess_opts)
+# 3. Studio AI Model Session
+# u2netp is ultra-crisp, lightweight (4MB), and produces sharp hair/shoulder cutouts
+rembg_session = new_session("u2netp")
 
-# 4. Official Government Form Specifications
+# 4. Government Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -44,12 +41,12 @@ class PhotoProcessor:
 
         specs = FORM_SPECS[form_id]
         
-        # 1. Load image and correct smartphone rotation
+        # 1. Load image and correct smartphone orientation
         raw_pil = Image.open(io.BytesIO(image_bytes))
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Standardize working size (keeps high quality while ensuring fast AI inference)
+        # Standardize working size (keeps high resolution while maintaining speed)
         original_pil.thumbnail((1200, 1200), Image.LANCZOS)
         original_np = np.array(original_pil)
 
@@ -64,17 +61,17 @@ class PhotoProcessor:
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop face with government 75% head-coverage ratio
+        # 3. Crop face with government 75% head coverage
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. High-Quality Neural Background Removal (The Original Colab Method)
+        # 4. Studio-Quality AI Background Removal (Original Colab Method)
         white_bg_pil = self._replace_background_studio(cropped_pil)
 
-        # 5. Resize to exact passport dimensions with LANCZOS antialiasing
+        # 5. Resize to exact passport dimensions with high-quality LANCZOS resampling
         resized_pil = white_bg_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
         
         # 6. Compress cleanly under target KB limit
@@ -152,17 +149,16 @@ class PhotoProcessor:
         return pil_image.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
 
     def _replace_background_studio(self, pil_image):
-        """Clean Neural Network Cutout + Pure Solid White Canvas"""
+        """Clean Neural AI Matting + Pure Solid White Matte"""
         try:
             img_byte_arr = io.BytesIO()
-            # Fast PNG compression for instant transfer
             pil_image.save(img_byte_arr, format="PNG", compress_level=1)
             
-            # Neural AI Matting
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=ai_session)
+            # AI Background Removal
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
             removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
-            # Solid White Base
+            # Solid White Canvas
             white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
             white_bg.paste(removed_bg, mask=removed_bg.split()[3])
             return white_bg.convert("RGB")
@@ -200,7 +196,7 @@ class PhotoProcessor:
 
 processor = PhotoProcessor()
 
-# Web Search & AI Helpers
+# 5. Web Search & AI Helpers
 def search_web(query, max_results=3):
     from duckduckgo_search import DDGS
     results = []
