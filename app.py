@@ -5,18 +5,18 @@ from PIL import Image, ImageOps
 import numpy as np
 import cv2
 
-# Set single thread to prevent CPU thread locking on Render free tier
+# Set thread limits for stability on Render free tier
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# 1. Flask App (Starts instantly in 0.01s so Render port check passes immediately)
+# 1. Initialize Flask
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Global Lazy AI Instances (Loaded ONLY on first photo upload)
+# Global Lazy AI Instances
 _face_cascade = None
 _rembg_session = None
 
@@ -26,7 +26,8 @@ def get_face_cascade():
         try:
             cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
             _face_cascade = cv2.CascadeClassifier(cascade_path)
-        except Exception:
+        except Exception as e:
+            print(f"Cascade error: {e}", flush=True)
             _face_cascade = None
     return _face_cascade
 
@@ -39,15 +40,14 @@ def get_rembg_session():
             opts = ort.SessionOptions()
             opts.intra_op_num_threads = 1
             opts.inter_op_num_threads = 1
-            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            # u2netp is only 4MB and ultra-fast
             _rembg_session = new_session("u2netp", session_options=opts)
+            print("✅ rembg session initialized successfully", flush=True)
         except Exception as e:
-            print(f"[Lazy Load rembg Error] {e}", flush=True)
+            print(f"[Lazy rembg Init Error] {e}", flush=True)
             _rembg_session = "FAILED"
     return _rembg_session
 
-# Form Specifications
+# 2. Government Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -69,7 +69,7 @@ class PhotoProcessor:
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Downscale large images to max 800px for speed
+        # Scale to max 800px for speed
         original_pil.thumbnail((800, 800), Image.LANCZOS)
         original_np = np.array(original_pil)
 
@@ -84,14 +84,14 @@ class PhotoProcessor:
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop face with government aspect ratio
+        # 3. Crop face with government ratio
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Resize to target dimensions FIRST
+        # 4. Resize to target dimensions
         resized_temp = cropped_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
 
         # 5. Studio-Grade AI Background Removal with Solid White Matte
@@ -222,6 +222,7 @@ class PhotoProcessor:
 
 processor = PhotoProcessor()
 
+# 3. Web Search & AI Helpers
 def search_web(query, max_results=3):
     from duckduckgo_search import DDGS
     results = []
@@ -229,8 +230,8 @@ def search_web(query, max_results=3):
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
                 results.append({"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")})
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Search Error] {e}", flush=True)
     return results
 
 def scrape_url(url, timeout=5):
@@ -249,7 +250,8 @@ def scrape_url(url, timeout=5):
             tag.decompose()
         text = soup.get_text(separator=" ", strip=True)
         return text[:2000] if text else None
-    except Exception:
+    except Exception as e:
+        print(f"[Scrape Error] {e}", flush=True)
         return None
 
 def ask_ai(query, context):
@@ -257,5 +259,86 @@ def ask_ai(query, context):
     try:
         if not GROQ_API_KEY:
             return "Please configure your GROQ_API_KEY in Render."
+        
         client = Groq(api_key=GROQ_API_KEY.strip())
-        all_models 
+        all_models = client.models.list().data
+        chat_candidates = [
+            m.id for m in all_models 
+            if not any(bad in m.id.lower() for bad in ["whisper", "guard", "audio", "embed", "orpheus", "vision"])
+        ]
+        
+        for model_id in chat_candidates:
+            try:
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[
+                        {"role": "system", "content": "You are FormSaathi AI, an Indian government scheme and document assistant. Provide clear, concise answers with source citations."},
+                        {"role": "user", "content": f"WEB CONTEXT:\n{context}\n\nUSER QUESTION: {query}"}
+                    ],
+                    temperature=0.2,
+                    max_tokens=800
+                )
+                return response.choices[0].message.content
+            except Exception:
+                continue
+
+        if context:
+            return f"**Information Found:**\n\n" + context[:1000] + "..."
+        return "No specific details found."
+    except Exception as e:
+        return f"AI Error: {str(e)}"
+
+# 4. HTTP Endpoints
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    try:
+        data = request.get_json(force=True)
+        query = data.get("query", "").strip()
+        if not query:
+            return jsonify({"error": "Missing query parameter"}), 400
+        
+        search_results = search_web(query, max_results=3)
+        all_context, sources = [], []
+        for r in search_results:
+            text = scrape_url(r["url"])
+            if text:
+                all_context.append(f"[{r['title']}] ({r['url']})\n{text}")
+                sources.append({"title": r["title"], "url": r["url"]})
+        
+        if not all_context:
+            all_context = [f"[{r['title']}] {r['snippet']}" for r in search_results]
+            sources = [{"title": r["title"], "url": r["url"]} for r in search_results]
+
+        answer = ask_ai(query, "\n\n---\n\n".join(all_context))
+        return jsonify({"success": True, "answer": answer, "sources": sources})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/process-photo", methods=["POST"])
+def process_photo():
+    try:
+        if "photo" not in request.files or "form_id" not in request.form:
+            return jsonify({"error": "Missing 'photo' or 'form_id'"}), 400
+        photo = request.files["photo"]
+        form_id = request.form["form_id"]
+        result = processor.process(photo.read(), form_id)
+        return jsonify(result)
+    except Exception as e:
+        print(f"Process photo error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/form-specs", methods=["GET"])
+def form_specs():
+    return jsonify({"success": True, "forms": FORM_SPECS})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
