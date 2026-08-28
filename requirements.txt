@@ -1,6 +1,7 @@
 flask
 flask-cors
-rembg
+gunicorn
+rembg[cpu]
 onnxruntime
 opencv-python-headless
 Pillow
@@ -8,4 +9,4 @@ groq
 duckduckgo-search
 trafilatura
 beautifulsoup4
-gunicorn
+numpy<2.0.0
