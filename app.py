@@ -233,3 +233,6 @@ with gr.Blocks() as demo:
     gr.Markdown("Direct endpoints available: `/ask`, `/process-photo`, `/form-specs`")
 
 app = gr.mount_gradio_app(app, demo, path="/")
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
