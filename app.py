@@ -1,30 +1,46 @@
-import os, io, gc, base64, time
-import numpy as np
-import cv2
-import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from PIL import Image, ImageOps
-import onnxruntime as ort
-from rembg import remove, new_session
-from duckduckgo_search import DDGS
-from groq import Groq
+import os, io, gc, time, base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from PIL import Image, ImageOps
+import numpy as np
+import cv2
+
+# Set single-thread limits to prevent CPU deadlocks on free tier
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# 1. OpenCV Built-in Face Detector (Instant, zero network download)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# Initialize Flask immediately so Render detects the port instantly
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# 2. Optimized Single-Threaded AI Session (Prevents CPU thread locking)
-sess_opts = ort.SessionOptions()
-sess_opts.intra_op_num_threads = 1
-sess_opts.inter_op_num_threads = 1
-sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-rembg_session = new_session("u2netp", session_options=sess_opts)
+# Global Lazy Holders (Loaded ONLY on demand, NEVER on server startup)
+_rembg_session = None
+_face_cascade = None
 
-# 3. Government Form Specifications
+def get_face_cascade():
+    global _face_cascade
+    if _face_cascade is None:
+        try:
+            _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        except Exception:
+            _face_cascade = None
+    return _face_cascade
+
+def get_rembg_session():
+    global _rembg_session
+    if _rembg_session is None:
+        import onnxruntime as ort
+        from rembg import new_session
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        _rembg_session = new_session("u2netp", session_options=opts)
+    return _rembg_session
+
+# Form Specifications
 FORM_SPECS = {
     "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
     "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
@@ -46,7 +62,7 @@ class PhotoProcessor:
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Scale to max 800px for lightning-fast facial geometry detection
+        # Fast downscale
         original_pil.thumbnail((800, 800), Image.LANCZOS)
         original_np = np.array(original_pil)
 
@@ -68,7 +84,7 @@ class PhotoProcessor:
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Resize to target dimensions FIRST (e.g. 413x531)
+        # 4. Resize to target dimensions
         resized_temp = cropped_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
 
         # 5. Studio-Grade AI Background Removal with Solid White Matte
@@ -84,7 +100,7 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        print(f"[PhotoProcessor] Processed {specs['name']} in {round(time.time() - t0, 2)}s")
+        print(f"[PhotoProcessor] Done in {round(time.time() - t0, 2)}s")
 
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_temp
         gc.collect()
@@ -97,12 +113,13 @@ class PhotoProcessor:
         }
 
     def _detect_face(self, image_np):
-        if face_cascade.empty():
+        cascade = get_face_cascade()
+        if cascade is None or cascade.empty():
             h, w = image_np.shape[:2]
             return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
         if len(faces) == 0:
             return {"face_found": False, "face_height_ratio": 0}
         
@@ -150,17 +167,19 @@ class PhotoProcessor:
 
     def _replace_background_ai(self, pil_image):
         try:
+            from rembg import remove
+            session = get_rembg_session()
             img_byte_arr = io.BytesIO()
             pil_image.save(img_byte_arr, format="PNG")
             
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
+            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=session)
             removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
             
             white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
             white_bg.paste(removed_bg, mask=removed_bg.split()[3])
             return white_bg.convert("RGB")
         except Exception as e:
-            print(f"[Background AI Error] {e}")
+            print(f"[AI Background Error] {e}")
             return pil_image.convert("RGB")
 
     def _compress_image(self, pil_image, max_size_kb):
@@ -193,7 +212,9 @@ class PhotoProcessor:
 
 processor = PhotoProcessor()
 
+# Web search & AI helpers
 def search_web(query, max_results=3):
+    from duckduckgo_search import DDGS
     results = []
     try:
         with DDGS() as ddgs:
@@ -204,6 +225,8 @@ def search_web(query, max_results=3):
     return results
 
 def scrape_url(url, timeout=5):
+    import requests, trafilatura
+    from bs4 import BeautifulSoup
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
@@ -221,6 +244,7 @@ def scrape_url(url, timeout=5):
         return None
 
 def ask_ai(query, context):
+    from groq import Groq
     try:
         if not GROQ_API_KEY:
             return "Please configure your GROQ_API_KEY in Render."
@@ -251,12 +275,7 @@ def ask_ai(query, context):
     except Exception as e:
         return f"AI Error: {str(e)}"
 
-# ============================================================
-# FLASK APP
-# ============================================================
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
+# Endpoints
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
