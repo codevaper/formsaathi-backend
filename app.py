@@ -23,7 +23,11 @@ if not os.path.exists(cascade_path):
     except Exception as e:
         print(f"Cascade download error: {e}")
 
-face_cascade = cv2.CascadeClassifier(cascade_path) if os.path.exists(cascade_path) else None
+try:
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+except Exception as e:
+    print(f"Face detector init error: {e}")
+    face_cascade = None
 
 # 2. Form Specifications
 FORM_SPECS = {
@@ -41,16 +45,14 @@ class PhotoProcessor:
 
         specs = FORM_SPECS[form_id]
         
-        # 1. Load image and fix mobile orientation
         raw_pil = Image.open(io.BytesIO(image_bytes))
         original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
         original_size_kb = len(image_bytes) / 1024
         
-        # Downscale large input photos for rapid processing (<0.1s)
+        # Fast downscale
         original_pil.thumbnail((1000, 1000), Image.LANCZOS)
         original_np = np.array(original_pil)
 
-        # 2. Detect face
         face_info = self._detect_face(original_np)
         if not face_info["face_found"]:
             return {
@@ -61,20 +63,14 @@ class PhotoProcessor:
 
         original_coverage = face_info["face_height_ratio"]
         
-        # 3. Crop face with government ratio
         cropped_pil = self._crop_and_center_face(
             original_pil, face_info, 
             specs["face_coverage_min"], specs["face_coverage_max"], 
             specs["width_px"], specs["height_px"]
         )
 
-        # 4. Instant pure white background application using GrabCut (0.15s)
         white_bg_pil = self._apply_white_background_fast(cropped_pil, face_info)
-        
-        # 5. Resize to exact passport dimensions
         resized_pil = white_bg_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
-        
-        # 6. Compress within size limit
         compressed_bytes, final_size_kb = self._compress_image(resized_pil, specs["max_size_kb"])
 
         final_np = np.array(Image.open(io.BytesIO(compressed_bytes)))
@@ -84,7 +80,6 @@ class PhotoProcessor:
         report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
         processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
 
-        # Cleanup RAM
         del original_np, final_np, raw_pil, white_bg_pil, cropped_pil
         gc.collect()
 
@@ -96,8 +91,10 @@ class PhotoProcessor:
         }
 
     def _detect_face(self, image_np):
-        if face_cascade is None:
-            return {"face_found": True, "x": 50, "y": 50, "w": 200, "h": 200, "face_height_ratio": 0.75, "img_w": image_np.shape[1], "img_h": image_np.shape[0]}
+        if face_cascade is None or face_cascade.empty():
+            # Fallback face box if classifier isn't loaded
+            h, w = image_np.shape[:2]
+            return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
         
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
@@ -147,12 +144,10 @@ class PhotoProcessor:
         return pil_image.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
 
     def _apply_white_background_fast(self, pil_image, face_info):
-        """Ultra-fast GrabCut background isolation (0.15s, no network downloads)"""
         try:
             cv_img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
             h, w = cv_img.shape[:2]
             
-            # Person bounding box estimate inside cropped image
             margin_x = int(w * 0.05)
             margin_y = int(h * 0.05)
             rect = (margin_x, margin_y, w - 2 * margin_x, h - margin_y)
@@ -161,17 +156,11 @@ class PhotoProcessor:
             bgdModel = np.zeros((1, 65), np.float64)
             fgdModel = np.zeros((1, 65), np.float64)
 
-            # 2 iterations are super fast and sufficient for clean studio look
             cv2.grabCut(cv_img, mask, rect, bgdModel, fgdModel, 2, cv2.GC_INIT_WITH_RECT)
-            
-            # Mask: Foreground & Probable Foreground = 1
             mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
-            
-            # Soften mask edges
             mask2 = cv2.GaussianBlur(mask2.astype(np.float32), (5, 5), 0)
             mask2 = np.expand_dims(mask2, axis=2)
 
-            # Blend with pure white background (255, 255, 255)
             white_bg = np.ones_like(cv_img, dtype=np.uint8) * 255
             result = (cv_img * mask2 + white_bg * (1.0 - mask2)).astype(np.uint8)
 
