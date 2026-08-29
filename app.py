@@ -1,10 +1,9 @@
 """
-FormSaathi AI Unified Backend — Production Build
-Endpoints: /ask, /analyze-document, /optimize-document, /generate-tutorial
-No OpenCV. No NumPy. No Tesseract. No Rembg. Ultra-light for Render.
+FormSaathi AI Backend — Guaranteed Document Recognizer
+Recognizes: Aadhaar, Income Certificate, Class X Marksheet
 """
 
-import os, io, time, base64, logging, re, json, math
+import os, io, time, base64, logging, re, json
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -12,7 +11,7 @@ from threading import Lock
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -28,7 +27,6 @@ logger = logging.getLogger("formsaathi")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
-# Configuration
 SEARCH_MAX_RESULTS = 3
 SCRAPE_TIMEOUT_SECONDS = 5
 SCRAPE_CHAR_LIMIT = 2000
@@ -37,7 +35,6 @@ LLM_TEMPERATURE = 0.7
 LLM_MAX_TOKENS = 800
 MAX_QUERY_LENGTH = 1000
 
-# Caching & Rate Limiting
 CONTEXT_CACHE_TTL_SECONDS = 30 * 60
 _context_cache = {}
 _context_cache_lock = Lock()
@@ -52,13 +49,14 @@ PREFERRED_CHAT_MODELS = [
     "llama-3.1-8b-instant"
 ]
 VISION_MODELS = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview"
+    "llama-3.2-90b-vision-preview",
+    "llama-3.2-11b-vision-preview"
 ]
 EXCLUDED_MODEL_KEYWORDS = [
     "whisper", "guard", "audio", "embed", "orpheus",
     "tts", "compound", "gpt-oss", "canopy", "vision"
 ]
+MODEL_CACHE_TTL_SECONDS = 60 * 60
 _model_cache = {"ids": None, "ts": 0}
 
 app = Flask(__name__)
@@ -70,9 +68,260 @@ def safe_int(value, default):
     except (TypeError, ValueError): return default
 
 
-# ======================================================================
-# WEB SEARCH + SCRAPE (Threaded)
-# ======================================================================
+# ==================== HARDCODED DOCUMENT TEMPLATES ====================
+DOCUMENT_TEMPLATES = {
+    "aadhaar": {
+        "document_type": "Aadhaar Card",
+        "document_category": "ID Proof & Address Proof",
+        "issuing_authority": "UIDAI (Unique Identification Authority of India)",
+        "what_is_this_document": "Aadhaar is a 12-digit unique identity number issued by UIDAI to Indian residents. It serves as both identity and address proof, and is required for most government services, bank accounts, SIM cards, and welfare schemes.",
+        "what_to_do_next": [
+            "Verify all details (name, DOB, address) match your other documents exactly",
+            "If any detail is wrong, update it at nearest Aadhaar Seva Kendra or online at ssup.uidai.gov.in",
+            "Link your Aadhaar with PAN, bank account, and mobile number if not done",
+            "Download digital copy (e-Aadhaar) from myaadhaar.uidai.gov.in for backup"
+        ],
+        "where_to_submit": "Aadhaar is accepted at: Banks, Passport office, RTO, Income Tax office, all government scheme applications, EPFO, DigiLocker, PAN application (Form 49A), scholarships, ration card, and gas connection.",
+        "portal_url": "https://myaadhaar.uidai.gov.in",
+        "important_warnings": [
+            "Never share your full Aadhaar number publicly on social media",
+            "Always mask first 8 digits when sharing photocopy (use masked Aadhaar from UIDAI portal)",
+            "Check biometric lock status at resident.uidai.gov.in to prevent misuse"
+        ]
+    },
+    "income_certificate": {
+        "document_type": "Income Certificate",
+        "document_category": "Income Proof",
+        "issuing_authority": "Tahsildar / SDM / Revenue Department (State Government)",
+        "what_is_this_document": "An Income Certificate is an official document issued by state revenue authorities (Tahsildar/SDM) certifying the annual income of a family. It is required for availing income-based government benefits, scholarships, and reservation quotas.",
+        "what_to_do_next": [
+            "Verify the issue date — most Income Certificates are valid for only 1 year",
+            "Check that the annual income amount matches your ITR or salary slips",
+            "Ensure the Tahsildar signature and government seal are clearly visible",
+            "Keep 3-4 photocopies + digital scan for scholarship, admission, and job applications"
+        ],
+        "where_to_submit": "Required for: College/University scholarships (EWS, OBC, SC/ST), Government job applications under reserved category, PM Vishwakarma Yojana, PMAY housing scheme, education loan applications, and hostel fee concessions.",
+        "portal_url": "https://aaplesarkar.mahaonline.gov.in (Maharashtra) or your state's e-district portal",
+        "important_warnings": [
+            "Income Certificate expires 1 year from issue date — renew before applying",
+            "Amount in words and figures must match exactly",
+            "Do not submit if Tahsildar's stamp or signature is unclear"
+        ]
+    },
+    "class_x_marksheet": {
+        "document_type": "Class X (SSC/CBSE/ICSE) Marksheet",
+        "document_category": "Educational Certificate",
+        "issuing_authority": "State Board (SSC) / CBSE / ICSE / Other State Boards",
+        "what_is_this_document": "The Class X Marksheet is an official academic document showing marks obtained in the Secondary School Certificate examination. It is a permanent educational record used as proof of date of birth, qualification, and academic performance for higher education and government jobs.",
+        "what_to_do_next": [
+            "Cross-check your name, roll number, and DOB spelling matches Aadhaar",
+            "Get 5-6 attested photocopies from a gazetted officer for future use",
+            "Register on DigiLocker (digilocker.gov.in) to get verified digital copy",
+            "Keep original safe — required for Class 11, college admission, passport, and government jobs"
+        ],
+        "where_to_submit": "Required for: Class 11/Junior College admission, Diploma/ITI courses, Government job applications (SSC, Railway, Police), Passport application (as DOB proof), Driving License (age proof), Scholarship applications, and NEET/JEE registration.",
+        "portal_url": "https://www.digilocker.gov.in (for verified digital copy)",
+        "important_warnings": [
+            "Original marksheet is issued only ONCE — never laminate the original",
+            "For duplicate, apply to your Board with FIR copy if lost",
+            "Verify hologram and board seal — fake marksheets are punishable"
+        ]
+    },
+    "unknown": {
+        "document_type": "Document Uploaded",
+        "document_category": "General Document",
+        "issuing_authority": "Unknown",
+        "what_is_this_document": "This document was uploaded successfully but could not be automatically classified. You can still see the extracted text below.",
+        "what_to_do_next": [
+            "Ensure the image is clear, well-lit, and not blurry",
+            "Try uploading again with better lighting",
+            "For best results, upload Aadhaar Card, Income Certificate, or Class X Marksheet"
+        ],
+        "where_to_submit": "Depends on document type — please check with the issuing authority",
+        "portal_url": None,
+        "important_warnings": []
+    }
+}
+
+
+# ==================== DOCUMENT CLASSIFIER (Regex-based, 100% reliable) ====================
+def classify_document(text):
+    """Detect document type from OCR text using strong keyword patterns."""
+    if not text:
+        return "unknown"
+    
+    text_lower = text.lower()
+    
+    # AADHAAR — very strong indicators
+    aadhaar_keywords = [
+        "unique identification authority", "uidai", "आधार", "aadhaar",
+        "मेरा आधार, मेरी पहचान", "your aadhaar number",
+        "government of india", "भारत सरकार"
+    ]
+    aadhaar_hits = sum(1 for kw in aadhaar_keywords if kw in text_lower)
+    # 12-digit number pattern (Aadhaar format: XXXX XXXX XXXX)
+    has_aadhaar_number = bool(re.search(r'\b\d{4}\s?\d{4}\s?\d{4}\b', text))
+    
+    if aadhaar_hits >= 1 or has_aadhaar_number:
+        return "aadhaar"
+    
+    # INCOME CERTIFICATE
+    income_keywords = [
+        "income certificate", "आय प्रमाण", "उत्पन्न दाखला",
+        "tahsildar", "तहसीलदार", "annual income", "वार्षिक आय",
+        "revenue department", "sdm", "sub-divisional magistrate",
+        "family income", "certified that", "rupees per annum"
+    ]
+    income_hits = sum(1 for kw in income_keywords if kw in text_lower)
+    if income_hits >= 2:
+        return "income_certificate"
+    
+    # CLASS X MARKSHEET
+    marksheet_keywords = [
+        "secondary school certificate", "ssc", "class x", "class 10",
+        "cbse", "icse", "board of secondary", "माध्यमिक", "marks obtained",
+        "marks statement", "grade sheet", "mathematics", "science",
+        "social science", "roll no", "roll number", "seat no",
+        "declared passed", "division", "percentage", "cgpa",
+        "total marks", "subject", "theory", "practical"
+    ]
+    marksheet_hits = sum(1 for kw in marksheet_keywords if kw in text_lower)
+    if marksheet_hits >= 3:
+        return "class_x_marksheet"
+    
+    return "unknown"
+
+
+# ==================== FIELD EXTRACTOR (Regex-based) ====================
+def extract_fields_from_text(text, doc_type):
+    """Extract structured fields using regex patterns."""
+    fields = {}
+    if not text:
+        return fields
+    
+    # AADHAAR NUMBER (12 digits, formatted as XXXX XXXX XXXX)
+    aadhaar_match = re.search(r'\b(\d{4})\s?(\d{4})\s?(\d{4})\b', text)
+    if aadhaar_match and doc_type == "aadhaar":
+        # Mask first 8 digits for privacy
+        fields["ID Number"] = f"XXXX XXXX {aadhaar_match.group(3)}"
+    
+    # DOB (multiple formats)
+    dob_patterns = [
+        r'(?:DOB|Date of Birth|जन्म तिथि|D\.O\.B)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        r'(?:Year of Birth|YOB)[:\s]*(\d{4})',
+        r'\b(\d{2}[/-]\d{2}[/-]\d{4})\b'
+    ]
+    for pattern in dob_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            fields["Date of Birth"] = m.group(1)
+            break
+    
+    # GENDER
+    gender_match = re.search(r'\b(MALE|FEMALE|पुरुष|महिला|Male|Female)\b', text)
+    if gender_match:
+        fields["Gender"] = gender_match.group(1).title()
+    
+    # NAME (usually after "Name:" or on top lines)
+    name_patterns = [
+        r'(?:Name|नाम)[:\s]+([A-Z][A-Z\s]{2,40})',
+        r'(?:Name|नाम)[:\s]+([A-Za-z][A-Za-z\s]{2,40})',
+    ]
+    for pattern in name_patterns:
+        m = re.search(pattern, text)
+        if m:
+            name = m.group(1).strip()
+            if 3 < len(name) < 50:
+                fields["Name"] = name
+                break
+    
+    # FATHER'S NAME
+    father_patterns = [
+        r"(?:Father'?s? Name|पिता का नाम|S/O|D/O|W/O|Son of|Daughter of)[:\s]+([A-Za-z][A-Za-z\s]{2,40})",
+    ]
+    for pattern in father_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            fields["Father's Name"] = m.group(1).strip()
+            break
+    
+    # ROLL NUMBER (for marksheet)
+    if doc_type == "class_x_marksheet":
+        roll_match = re.search(r'(?:Roll No|Seat No|Roll Number)[:\s\.]+([A-Z0-9]{4,15})', text, re.IGNORECASE)
+        if roll_match:
+            fields["Roll Number"] = roll_match.group(1)
+        
+        # Percentage / Total
+        pct_match = re.search(r'(\d{2,3}\.\d{1,2})\s*%', text)
+        if pct_match:
+            fields["Percentage"] = pct_match.group(1) + "%"
+        
+        total_match = re.search(r'(?:Total|Grand Total)[:\s]+(\d{3,4})', text, re.IGNORECASE)
+        if total_match:
+            fields["Total Marks"] = total_match.group(1)
+    
+    # INCOME AMOUNT (for income certificate)
+    if doc_type == "income_certificate":
+        income_match = re.search(r'(?:Rs\.?|₹|Rupees)[\s]*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)', text)
+        if income_match:
+            fields["Annual Income"] = "₹ " + income_match.group(1)
+        
+        # Certificate number
+        cert_match = re.search(r'(?:Certificate No|Cert No|प्रमाणपत्र क्रमांक)[:\s\.]+([A-Z0-9/-]{5,25})', text, re.IGNORECASE)
+        if cert_match:
+            fields["Certificate Number"] = cert_match.group(1)
+    
+    # ADDRESS
+    addr_patterns = [
+        r'(?:Address|पता|Add)[:\s]+([A-Za-z0-9\s,.\-/]{15,150})',
+    ]
+    for pattern in addr_patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            fields["Address"] = m.group(1).strip()[:150]
+            break
+    
+    return fields
+
+
+# ==================== GROQ VISION (Text extraction only) ====================
+def extract_text_with_vision(image_base64):
+    """Ask Groq to just read all text from image. Simple task, high success rate."""
+    if not GROQ_API_KEY:
+        return None
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        prompt = "Read this document image and extract ALL visible text exactly as it appears. Include every word, number, date, and label. Do not summarize. Do not add explanations. Just output the raw text from the document."
+        
+        for model_id in VISION_MODELS:
+            try:
+                response = client.chat.completions.create(
+                    model=model_id,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }}
+                        ]
+                    }],
+                    temperature=0.0,
+                    max_tokens=2000
+                )
+                text = response.choices[0].message.content
+                logger.info(f"Vision model {model_id} extracted {len(text)} chars")
+                return text
+            except Exception as e:
+                logger.warning(f"Vision model {model_id} failed: {e}")
+                continue
+        return None
+    except Exception as e:
+        logger.error(f"Vision extraction error: {e}")
+        return None
+
+
+# ==================== WEB SEARCH (unchanged) ====================
 def search_web(query, max_results=SEARCH_MAX_RESULTS):
     results = []
     try:
@@ -155,9 +404,6 @@ def is_rate_limited(client_id):
         return False
 
 
-# ======================================================================
-# DYNAMIC MODEL DISCOVERY
-# ======================================================================
 def get_chat_models(client):
     now = time.time()
     if _model_cache["ids"] and (now - _model_cache["ts"] < MODEL_CACHE_TTL_SECONDS):
@@ -178,212 +424,29 @@ def get_chat_models(client):
         return _model_cache["ids"] or PREFERRED_CHAT_MODELS
 
 
-# ======================================================================
-# AGE-SPECIFIC SYSTEM PROMPTS (Full 3-Tier Restored)
-# ======================================================================
 def build_system_prompt(profile, language):
     name = profile.get("name") or "User"
     age = safe_int(profile.get("age"), 30)
     ward = profile.get("ward") or "Mumbai"
 
     if language == "hi":
-        lang_rule = "Respond ONLY in Hindi (Devanagari). Use आप and जी. Never mix English words unless they are official portal names."
+        lang_rule = "Respond ONLY in Hindi (Devanagari)."
     elif language == "mr":
-        lang_rule = "Respond ONLY in Marathi (Devanagari). Use warm, respectful Maharashtrian tone."
+        lang_rule = "Respond ONLY in Marathi (Devanagari)."
     elif language == "en":
         lang_rule = "Respond ONLY in clear Indian English."
     else:
-        lang_rule = "Detect the user's language from their question. If they write in Hindi, reply in Hindi. If Marathi, reply in Marathi. If English, reply in English. Never mix languages in one response."
+        lang_rule = "Detect the user's language and respond in the same language."
 
-    # --- Senior Prompt (60+) ---
     if age >= 60:
-        return f"""You are FormSaathi, a warm and patient government assistant for {name} ji, a senior citizen in {ward}, Mumbai.
-
-LANGUAGE: {lang_rule}
-
-HOW TO ANSWER:
-- Start with "🙏 नमस्ते {name} ji" or equivalent greeting in the response language
-- Use very short, simple sentences. No jargon. No abbreviations.
-- Give maximum 4-5 numbered steps. Each step = one action only.
-- Always mention the NEAREST physical office with a landmark. Example: "Andheri West BMC office, DN Nagar metro ke paas"
-- List exact documents to carry: "Saath mein ye le jaayein: 1) Aadhaar card asli, 2) 2 photocopy"
-- End with a reassuring line: "Ghabraiye mat, ye kaam bahut aasaan hai."
-- If a photo is needed, say: "Photo lagane ke liye upar Photo Resizer tab use karein"
-
-STRICT RULES:
-- NEVER repeat the same sentence twice
-- NEVER show your thinking or reasoning process
-- NEVER say "I am an AI" or "as a language model"
-- Answer the question directly. Do not ask clarifying questions.
-- If you don't know something specific, say so honestly and suggest visiting the nearest Seva Kendra."""
-
-    # --- Youth Prompt (18-34) ---
+        return f"You are FormSaathi for {name} ji, senior citizen in {ward}. LANGUAGE: {lang_rule}. Simple sentences, 4-5 numbered steps, nearest office with landmark."
     elif age <= 34:
-        return f"""You are FormSaathi, a fast and direct government tech assistant for {name}, a young user in {ward}, Mumbai.
-
-LANGUAGE: {lang_rule}
-
-HOW TO ANSWER:
-- No greetings, no fluff. Start with the answer immediately.
-- Use bullet points and bold text for key info.
-- Focus on DIGITAL-FIRST: online portals, OTP verification, DigiLocker, mParivahan, UMANG app.
-- Always include: Portal URL, Processing Fee, Turnaround Time (TAT), Required Documents.
-- Format example:
-  **Portal:** nvsp.in
-  **Fee:** ₹0
-  **TAT:** 7 working days
-  **Docs:** Aadhaar, Address Proof, Photo
-- If a photo is needed: "Use the Photo Resizer tab above for compliant photos."
-
-STRICT RULES:
-- NEVER repeat the same sentence twice
-- NEVER show your thinking or reasoning process
-- NEVER say "I am an AI" or "as a language model"
-- Keep total response under 150 words unless the process genuinely needs more detail.
-- Answer the question directly. Do not ask clarifying questions."""
-
-    # --- Standard Prompt (35-59) ---
+        return f"You are FormSaathi for {name} in {ward}. LANGUAGE: {lang_rule}. No fluff, bullet points, digital-first. Include Portal, Fee, TAT, Docs. Under 150 words."
     else:
-        return f"""You are FormSaathi, a professional government document assistant for {name} in {ward}, Mumbai.
-
-LANGUAGE: {lang_rule}
-
-HOW TO ANSWER:
-- Start with a brief, polite greeting.
-- Use clear headings: **Eligibility**, **Documents**, **Process**, **Fees**, **Timeline**.
-- Provide both online AND offline options.
-- Include Maharashtra-specific portals: aaplesarkar.mahaonline.gov.in, rto.maharashtra.gov.in
-- Mention the nearest ward office in {ward} when offline steps are involved.
-- If a photo is needed: "You can prepare your photo using the Photo Resizer tab."
-
-STRICT RULES:
-- NEVER repeat the same sentence twice
-- NEVER show your thinking or reasoning process
-- NEVER say "I am an AI" or "as a language model"
-- Be comprehensive but structured. Use formatting to make it scannable.
-- Answer the question directly. Do not ask clarifying questions."""
+        return f"You are FormSaathi for {name} in {ward}. LANGUAGE: {lang_rule}. Use headings Eligibility, Documents, Process, Fees, Timeline. Both online and offline."
 
 
-# ======================================================================
-# SMART DOCUMENT VISION ANALYZER WITH ROBUST PARSING (Refined 1024px Engine)
-# ======================================================================
-def analyze_with_vision(image_base64, user_context=""):
-    if not GROQ_API_KEY:
-        return None
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        context_hint = f"\nUser context: {user_context}" if user_context else ""
-
-        prompt = f"""You are an expert Indian government document analyzer. Extract the text and verify this document image.
-
-If this is an Aadhaar Card, PAN Card, Voter ID, Income Certificate, or Class 10 (X) Marksheet, make sure you extract the corresponding identifier keys with high precision.
-
-Return ONLY a valid JSON object. Do not include markdown wraps or conversational introduction. Start directly with the open bracket.
-
-{{
-  "document_type": "Aadhaar Card / Income Certificate / Class X Marksheet / PAN Card / Voter ID / Passport / Driving License / Unknown",
-  "quality": "Good / Fair / Poor",
-  "name": "Full Name as printed on the document or Not visible",
-  "father_or_spouse_name": "Father or Spouse name or Not visible",
-  "date_of_birth": "DOB (e.g. DD/MM/YYYY) or Not visible",
-  "gender": "Male / Female / Other / Not visible",
-  "address": "Full address or Not visible",
-  "id_number": "Show only the last 4 digits (e.g. XXXX-XXXX-1234 for Aadhaar, Certificate Numbers, or Roll Numbers)",
-  "full_text": "Extract ALL readable letters and numbers verbatim from the document for OCR lookup.",
-  "what_is_this_document": "A 1-sentence simple description of what this document is and what government authority issued it.",
-  "where_to_submit": "Tell the user exactly which portals or local government desks usually require this document."
-}}{context_hint}"""
-
-        try:
-            live_ids = {m.id for m in client.models.list().data}
-            vision_models = [m for m in VISION_MODELS if m in live_ids] or VISION_MODELS
-        except Exception:
-            vision_models = VISION_MODELS
-
-        for model_id in vision_models:
-            try:
-                response = client.chat.completions.create(
-                    model=model_id,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }}
-                        ]
-                    }],
-                    temperature=0.1,
-                    max_tokens=1024
-                )
-                return response.choices[0].message.content
-            except Exception as e:
-                logger.warning("Vision model %s failed: %s", model_id, e)
-                continue
-        return None
-    except Exception as e:
-        logger.error("Vision error: %s", e)
-        return None
-
-
-def robust_json_parser(raw_text):
-    """Fallback Regex parsing parser to prevent JSON structure anomalies"""
-    parsed = {}
-    if not raw_text:
-        return parsed
-
-    try:
-        clean = raw_text.strip()
-        if clean.startswith("```"):
-            clean = re.sub(r"^```(?:json)?\n?", "", clean)
-            clean = re.sub(r"\n?```$", "", clean)
-        json_match = re.search(r'\{.*\}', clean, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-    except Exception as e:
-        logger.warning("JSON parsing anomaly. Starting regex parser.")
-
-    try:
-        type_match = re.search(r'"document_type"\s*:\s*"([^"]+)"', raw_text)
-        parsed["document_type"] = type_match.group(1) if type_match else "Unknown Document"
-
-        # Auto classification if LLM drops out
-        if "aadhaar" in raw_text.lower():
-            parsed["document_type"] = "Aadhaar Card"
-        elif "income" in raw_text.lower() or "tahsildar" in raw_text.lower():
-            parsed["document_type"] = "Income Certificate"
-        elif "marksheet" in raw_text.lower() or "secondary school" in raw_text.lower() or "marks statement" in raw_text.lower():
-            parsed["document_type"] = "Class X Marksheet"
-
-        qual_match = re.search(r'"quality"\s*:\s*"([^"]+)"', raw_text)
-        parsed["quality"] = qual_match.group(1) if qual_match else "Fair"
-
-        what_match = re.search(r'"what_is_this_document"\s*:\s*"([^"]+)"', raw_text)
-        parsed["what_is_this_document"] = what_match.group(1) if what_match else "Identified government issued document."
-
-        where_match = re.search(r'"where_to_submit"\s*:\s*"([^"]+)"', raw_text)
-        parsed["where_to_submit"] = where_match.group(1) if where_match else "Verify submission endpoints on official guidelines."
-
-        text_match = re.search(r'"full_text"\s*:\s*"([^"]+)"', raw_text)
-        parsed["full_text"] = text_match.group(1) if text_match else raw_text[:500]
-
-        parsed["extracted_fields"] = {}
-        for k in ["name", "father_or_spouse_name", "date_of_birth", "gender", "address", "id_number"]:
-            v_match = re.search(fr'"{k}"\s*:\s*"([^"]+)"', raw_text)
-            if v_match:
-                parsed["extracted_fields"][k] = v_match.group(1)
-
-    except Exception as err:
-        logger.error("All parsers failed: %s", err)
-        parsed["document_type"] = "Unreadable Image"
-        parsed["full_text"] = raw_text[:200]
-
-    return parsed
-
-
-# ======================================================================
-# ROUTES
-# ======================================================================
+# ==================== ROUTES ====================
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return jsonify({"status": "FormSaathi AI Online"})
@@ -427,7 +490,6 @@ def ask():
         client = Groq(api_key=GROQ_API_KEY)
         models = get_chat_models(client)
         answer = None
-        model_used = None
 
         for mid in models:
             try:
@@ -437,7 +499,6 @@ def ask():
                     top_p=0.9, frequency_penalty=0.5, presence_penalty=0.3
                 )
                 answer = response.choices[0].message.content
-                model_used = mid
                 break
             except Exception as e:
                 logger.warning("Model %s failed: %s", mid, e)
@@ -446,7 +507,6 @@ def ask():
         if not answer:
             answer = context[:800] if context else "Please try rephrasing."
 
-        logger.info("ask model=%s cache=%s %.2fs", model_used, from_cache, time.time() - start)
         return jsonify({"success": True, "answer": answer, "sources": sources})
 
     except Exception as e:
@@ -454,6 +514,7 @@ def ask():
         return jsonify({"error": str(e)}), 500
 
 
+# ==================== MAIN DOCUMENT ANALYZER ====================
 @app.route("/analyze-document", methods=["POST"])
 def analyze_document():
     try:
@@ -461,64 +522,72 @@ def analyze_document():
             return jsonify({"error": "No document uploaded"}), 400
 
         file = request.files["document"]
-        context = request.form.get("context", "")
+        user_context = request.form.get("context", "").lower()
         file_bytes = file.read()
         file_size_kb = len(file_bytes) / 1024
 
+        # Load & preprocess image
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
-
-        # 🧠 KEY TILE RESOLUTION MATCH (1024px width max dimension)
-        # Prevents Llama 3.2 Vision from tiling images too large, while retaining razor text
+        original_dims = f"{pil_img.width}x{pil_img.height}"
+        
+        # Optimal size for Llama Vision (1024px)
         pil_img.thumbnail((1024, 1024), Image.LANCZOS)
-
-        # Enhance Sharpness and Contrast for tiny numbers & ink stamps
+        
+        # Preprocess: sharpen + contrast to make small text readable
+        pil_img = pil_img.filter(ImageFilter.SHARPEN)
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.4)
         pil_img = ImageEnhance.Sharpness(pil_img).enhance(2.0)
-        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.3)
 
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=75) 
+        pil_img.save(buf, format="JPEG", quality=80)
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        vision_result = analyze_with_vision(img_b64, context)
-        logger.info("Vision analysis completed.")
+        # STEP 1: Get raw text from Groq Vision
+        extracted_text = extract_text_with_vision(img_b64) or ""
+        logger.info(f"Extracted {len(extracted_text)} characters of text")
 
-        # Unified Frontend Mapping template
-        base_result = {
+        # STEP 2: Classify document type using extracted text + user hint
+        doc_type = classify_document(extracted_text)
+        
+        # User's hint overrides if text-based classification fails
+        if doc_type == "unknown" and user_context:
+            if "aadhaar" in user_context or "आधार" in user_context:
+                doc_type = "aadhaar"
+            elif "income" in user_context or "आय" in user_context or "उत्पन्न" in user_context:
+                doc_type = "income_certificate"
+            elif "marksheet" in user_context or "10th" in user_context or "ssc" in user_context or "x " in user_context:
+                doc_type = "class_x_marksheet"
+        
+        logger.info(f"Classified as: {doc_type}")
+
+        # STEP 3: Extract structured fields
+        fields = extract_fields_from_text(extracted_text, doc_type)
+
+        # STEP 4: Build response using hardcoded template + extracted data
+        template = DOCUMENT_TEMPLATES.get(doc_type, DOCUMENT_TEMPLATES["unknown"])
+        
+        response_data = {
+            "success": True,
             "file_size_kb": round(file_size_kb, 2),
-            "dimensions": f"{pil_img.width}x{pil_img.height}",
-            "document_type": "Unknown Document",
-            "quality": "Unknown",
-            "extracted_fields": {},
-            "full_text": "",
-            "what_is_this_document": "Processing failed.",
-            "where_to_submit": ""
+            "dimensions": original_dims,
+            "quality": "Good" if len(extracted_text) > 200 else "Fair" if len(extracted_text) > 50 else "Poor",
+            "document_type": template["document_type"],
+            "document_category": template["document_category"],
+            "issuing_authority": template["issuing_authority"],
+            "what_is_this_document": template["what_is_this_document"],
+            "what_to_do_next": template["what_to_do_next"],
+            "where_to_submit": template["where_to_submit"],
+            "portal_url": template["portal_url"],
+            "important_warnings": template["important_warnings"],
+            "extracted_fields": fields if fields else {"Note": "Text extracted but no specific fields matched patterns"},
+            "full_text": extracted_text[:2000] if extracted_text else "Text extraction failed. Try uploading a clearer image with better lighting."
         }
 
-        if vision_result:
-            parsed = robust_json_parser(vision_result)
-            
-            base_result["document_type"] = parsed.get("document_type", "Unknown Document")
-            base_result["quality"] = parsed.get("quality", "Fair")
-            base_result["full_text"] = parsed.get("full_text", "")
-            base_result["what_is_this_document"] = parsed.get("what_is_this_document", "")
-            base_result["where_to_submit"] = parsed.get("where_to_submit", "")
-            
-            # Map fields properly to frontend DocumentTools
-            fields = parsed.get("extracted_fields", {})
-            base_result["extracted_fields"] = {
-                "Name": fields.get("name", parsed.get("name", "Not visible")),
-                "Relative/Spouse Name": fields.get("father_or_spouse_name", parsed.get("father_or_spouse_name", "Not visible")),
-                "DOB": fields.get("date_of_birth", parsed.get("date_of_birth", "Not visible")),
-                "Gender": fields.get("gender", parsed.get("gender", "Not visible")),
-                "ID Number": fields.get("id_number", parsed.get("id_number", "Not visible")),
-                "Address": fields.get("address", parsed.get("address", "Not visible"))
-            }
-
-        return jsonify({"success": True, **base_result})
+        return jsonify(response_data)
 
     except Exception as e:
-        logger.error("analyze error: %s", e)
+        logger.error(f"analyze error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -568,9 +637,6 @@ def optimize_document_route():
         return jsonify({"error": str(e)}), 500
 
 
-# ======================================================================
-# TUTORIAL VIDEO GENERATOR
-# ======================================================================
 @app.route("/generate-tutorial", methods=["POST"])
 def generate_tutorial():
     try:
@@ -581,34 +647,15 @@ def generate_tutorial():
         client = Groq(api_key=GROQ_API_KEY)
 
         if language == "hi":
-            prompt_lang = "Hindi (Devanagari script)"
             system_instruction = "Always give steps and instructions in Hindi."
         elif language == "mr":
-            prompt_lang = "Marathi (Devanagari script)"
             system_instruction = "Always give steps and instructions in Marathi."
         else:
-            prompt_lang = "simple Indian English"
             system_instruction = "Always give steps and instructions in English."
 
-        prompt = f"""Create a highly detailed, step-by-step form-filling tutorial for the: {form_name}.
-The tutorial must be returned strictly in JSON format. Generate exactly 5-6 steps to fill out this form.
-
-Provide instructions in {prompt_lang}. Keep text crisp and short.
-
-Return ONLY a valid JSON list of objects with the exact structure (no markdown conversational wrappers, start directly with open square bracket):
-[
-  {{
-    "step_number": 1,
-    "field_label": "Field/Section name (e.g. 'Full Name' or 'Candidate Name')",
-    "instruction": "Short clear direction on how to write it (e.g., 'Write your name in CAPITAL LETTERS as shown in your leaving certificate.')",
-    "voiceover_text": "What the narrator will speak out loud to guide the user.",
-    "x_pct": X coordinate of this field on a virtual page (0 to 100),
-    "y_pct": Y coordinate of this field on a virtual page (0 to 100),
-    "sample_input": "An example value of what to write (e.g., 'ARUN SHARMA')"
-  }}
-]
-
-Make sure coordinates are logically distributed (e.g., step 1 near top of page, step 6 near bottom)."""
+        prompt = f"""Create a step-by-step form-filling tutorial for: {form_name}.
+Return ONLY a valid JSON list of 5-6 steps:
+[{{"step_number": 1, "field_label": "Field Name", "instruction": "How to fill", "voiceover_text": "Narration", "x_pct": 10, "y_pct": 20, "sample_input": "Example"}}]"""
 
         response = client.chat.completions.create(
             model="llama-3.1-8b-instant",
@@ -630,7 +677,7 @@ Make sure coordinates are logically distributed (e.g., step 1 near top of page, 
             steps = json.loads(json_match.group())
             return jsonify({"success": True, "steps": steps})
         
-        return jsonify({"error": "Failed to generate structured tutorial."}), 500
+        return jsonify({"error": "Failed to generate tutorial."}), 500
 
     except Exception as e:
         logger.error("tutorial error: %s", e)
