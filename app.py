@@ -1,5 +1,5 @@
 """
-FormSaathi AI Backend — Guaranteed Document Recognizer
+FormSaathi AI Backend — Guaranteed Document Recognizer (Diagnostic Edition)
 Recognizes: Aadhaar, Income Certificate, Class X Marksheet
 """
 
@@ -48,15 +48,17 @@ PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant"
 ]
+
+# 🧠 CRITICAL PRIORITY: Put 11b-vision FIRST. It is lighter, faster, and bypasses TPM limits.
 VISION_MODELS = [
-    "llama-3.2-90b-vision-preview",
-    "llama-3.2-11b-vision-preview"
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview"
 ]
+
 EXCLUDED_MODEL_KEYWORDS = [
     "whisper", "guard", "audio", "embed", "orpheus",
     "tts", "compound", "gpt-oss", "canopy", "vision"
 ]
-MODEL_CACHE_TTL_SECONDS = 60 * 60
 _model_cache = {"ids": None, "ts": 0}
 
 app = Flask(__name__)
@@ -144,24 +146,20 @@ DOCUMENT_TEMPLATES = {
 }
 
 
-# ==================== DOCUMENT CLASSIFIER (Regex-based, 100% reliable) ====================
+# ==================== DOCUMENT CLASSIFIER (Regex-based) ====================
 def classify_document(text):
-    """Detect document type from OCR text using strong keyword patterns."""
     if not text:
         return "unknown"
     
     text_lower = text.lower()
     
-    # AADHAAR — very strong indicators
+    # AADHAAR
     aadhaar_keywords = [
         "unique identification authority", "uidai", "आधार", "aadhaar",
-        "मेरा आधार, मेरी पहचान", "your aadhaar number",
         "government of india", "भारत सरकार"
     ]
     aadhaar_hits = sum(1 for kw in aadhaar_keywords if kw in text_lower)
-    # 12-digit number pattern (Aadhaar format: XXXX XXXX XXXX)
     has_aadhaar_number = bool(re.search(r'\b\d{4}\s?\d{4}\s?\d{4}\b', text))
-    
     if aadhaar_hits >= 1 or has_aadhaar_number:
         return "aadhaar"
     
@@ -169,24 +167,21 @@ def classify_document(text):
     income_keywords = [
         "income certificate", "आय प्रमाण", "उत्पन्न दाखला",
         "tahsildar", "तहसीलदार", "annual income", "वार्षिक आय",
-        "revenue department", "sdm", "sub-divisional magistrate",
-        "family income", "certified that", "rupees per annum"
+        "revenue department", "certified that", "rupees per annum"
     ]
     income_hits = sum(1 for kw in income_keywords if kw in text_lower)
-    if income_hits >= 2:
+    if income_hits >= 1:
         return "income_certificate"
     
     # CLASS X MARKSHEET
     marksheet_keywords = [
         "secondary school certificate", "ssc", "class x", "class 10",
         "cbse", "icse", "board of secondary", "माध्यमिक", "marks obtained",
-        "marks statement", "grade sheet", "mathematics", "science",
-        "social science", "roll no", "roll number", "seat no",
-        "declared passed", "division", "percentage", "cgpa",
-        "total marks", "subject", "theory", "practical"
+        "marks statement", "grade sheet", "roll no", "roll number", "seat no",
+        "subject", "theory", "practical", "marksheet"
     ]
     marksheet_hits = sum(1 for kw in marksheet_keywords if kw in text_lower)
-    if marksheet_hits >= 3:
+    if marksheet_hits >= 2:
         return "class_x_marksheet"
     
     return "unknown"
@@ -194,18 +189,17 @@ def classify_document(text):
 
 # ==================== FIELD EXTRACTOR (Regex-based) ====================
 def extract_fields_from_text(text, doc_type):
-    """Extract structured fields using regex patterns."""
     fields = {}
     if not text:
         return fields
     
-    # AADHAAR NUMBER (12 digits, formatted as XXXX XXXX XXXX)
-    aadhaar_match = re.search(r'\b(\d{4})\s?(\d{4})\s?(\d{4})\b', text)
-    if aadhaar_match and doc_type == "aadhaar":
-        # Mask first 8 digits for privacy
-        fields["ID Number"] = f"XXXX XXXX {aadhaar_match.group(3)}"
+    # Aadhaar Number
+    if doc_type == "aadhaar":
+        aadhaar_match = re.search(r'\b(\d{4})\s?(\d{4})\s?(\d{4})\b', text)
+        if aadhaar_match:
+            fields["ID Number"] = f"XXXX XXXX {aadhaar_match.group(3)}"
     
-    # DOB (multiple formats)
+    # DOB
     dob_patterns = [
         r'(?:DOB|Date of Birth|जन्म तिथि|D\.O\.B)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
         r'(?:Year of Birth|YOB)[:\s]*(\d{4})',
@@ -217,12 +211,12 @@ def extract_fields_from_text(text, doc_type):
             fields["Date of Birth"] = m.group(1)
             break
     
-    # GENDER
+    # Gender
     gender_match = re.search(r'\b(MALE|FEMALE|पुरुष|महिला|Male|Female)\b', text)
     if gender_match:
         fields["Gender"] = gender_match.group(1).title()
     
-    # NAME (usually after "Name:" or on top lines)
+    # Name
     name_patterns = [
         r'(?:Name|नाम)[:\s]+([A-Z][A-Z\s]{2,40})',
         r'(?:Name|नाम)[:\s]+([A-Za-z][A-Za-z\s]{2,40})',
@@ -230,69 +224,41 @@ def extract_fields_from_text(text, doc_type):
     for pattern in name_patterns:
         m = re.search(pattern, text)
         if m:
-            name = m.group(1).strip()
-            if 3 < len(name) < 50:
-                fields["Name"] = name
-                break
-    
-    # FATHER'S NAME
-    father_patterns = [
-        r"(?:Father'?s? Name|पिता का नाम|S/O|D/O|W/O|Son of|Daughter of)[:\s]+([A-Za-z][A-Za-z\s]{2,40})",
-    ]
-    for pattern in father_patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            fields["Father's Name"] = m.group(1).strip()
+            fields["Name"] = m.group(1).strip()
             break
     
-    # ROLL NUMBER (for marksheet)
+    # Class X Marksheet specific
     if doc_type == "class_x_marksheet":
         roll_match = re.search(r'(?:Roll No|Seat No|Roll Number)[:\s\.]+([A-Z0-9]{4,15})', text, re.IGNORECASE)
         if roll_match:
             fields["Roll Number"] = roll_match.group(1)
         
-        # Percentage / Total
         pct_match = re.search(r'(\d{2,3}\.\d{1,2})\s*%', text)
         if pct_match:
             fields["Percentage"] = pct_match.group(1) + "%"
-        
-        total_match = re.search(r'(?:Total|Grand Total)[:\s]+(\d{3,4})', text, re.IGNORECASE)
-        if total_match:
-            fields["Total Marks"] = total_match.group(1)
     
-    # INCOME AMOUNT (for income certificate)
+    # Income Certificate specific
     if doc_type == "income_certificate":
         income_match = re.search(r'(?:Rs\.?|₹|Rupees)[\s]*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)', text)
         if income_match:
             fields["Annual Income"] = "₹ " + income_match.group(1)
-        
-        # Certificate number
+            
         cert_match = re.search(r'(?:Certificate No|Cert No|प्रमाणपत्र क्रमांक)[:\s\.]+([A-Z0-9/-]{5,25})', text, re.IGNORECASE)
         if cert_match:
             fields["Certificate Number"] = cert_match.group(1)
     
-    # ADDRESS
-    addr_patterns = [
-        r'(?:Address|पता|Add)[:\s]+([A-Za-z0-9\s,.\-/]{15,150})',
-    ]
-    for pattern in addr_patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            fields["Address"] = m.group(1).strip()[:150]
-            break
-    
     return fields
 
 
-# ==================== GROQ VISION (Text extraction only) ====================
+# ==================== GROQ VISION (Diagnostic Version) ====================
 def extract_text_with_vision(image_base64):
-    """Ask Groq to just read all text from image. Simple task, high success rate."""
     if not GROQ_API_KEY:
-        return None
+        return "ERROR: GROQ_API_KEY env var is missing on Render!"
     try:
         client = Groq(api_key=GROQ_API_KEY)
         prompt = "Read this document image and extract ALL visible text exactly as it appears. Include every word, number, date, and label. Do not summarize. Do not add explanations. Just output the raw text from the document."
         
+        last_error = ""
         for model_id in VISION_MODELS:
             try:
                 response = client.chat.completions.create(
@@ -313,15 +279,18 @@ def extract_text_with_vision(image_base64):
                 logger.info(f"Vision model {model_id} extracted {len(text)} chars")
                 return text
             except Exception as e:
-                logger.warning(f"Vision model {model_id} failed: {e}")
+                last_error = str(e)
+                logger.warning(f"Vision model {model_id} failed: {last_error}")
                 continue
-        return None
+        
+        # If all models failed, expose the raw API error instead of hiding it!
+        return f"ERROR_FROM_GROQ_API: {last_error}"
     except Exception as e:
         logger.error(f"Vision extraction error: {e}")
-        return None
+        return f"BACKEND_EXCEPTION: {str(e)}"
 
 
-# ==================== WEB SEARCH (unchanged) ====================
+# ==================== SCRAPER & CHAT ====================
 def search_web(query, max_results=SEARCH_MAX_RESULTS):
     results = []
     try:
@@ -526,31 +495,38 @@ def analyze_document():
         file_bytes = file.read()
         file_size_kb = len(file_bytes) / 1024
 
-        # Load & preprocess image
+        # Load image
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
         original_dims = f"{pil_img.width}x{pil_img.height}"
         
-        # Optimal size for Llama Vision (1024px)
-        pil_img.thumbnail((1024, 1024), Image.LANCZOS)
+        # 🧠 SWEET SPOT RESOLUTION (800px): Retains maximum document readability 
+        # while dropping base64 footprint significantly to bypass Rate-Limits.
+        pil_img.thumbnail((800, 800), Image.LANCZOS)
         
-        # Preprocess: sharpen + contrast to make small text readable
+        # Sharpness & Contrast enhancement 
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
-        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.4)
-        pil_img = ImageEnhance.Sharpness(pil_img).enhance(2.0)
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.3)
+        pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.8)
 
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=80)
+        pil_img.save(buf, format="JPEG", quality=70) # Quality 70 keeps it ultra-lightweight
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # STEP 1: Get raw text from Groq Vision
+        # Get raw text
         extracted_text = extract_text_with_vision(img_b64) or ""
-        logger.info(f"Extracted {len(extracted_text)} characters of text")
+        
+        # Check if the extracted text contains an explicit API error!
+        if "ERROR_FROM_GROQ_API:" in extracted_text or "BACKEND_EXCEPTION:" in extracted_text or "ERROR:" in extracted_text:
+            return jsonify({
+                "success": False,
+                "error": f"Groq Connection Failed! Details: {extracted_text}"
+            }), 500
 
-        # STEP 2: Classify document type using extracted text + user hint
+        # Classify document
         doc_type = classify_document(extracted_text)
         
-        # User's hint overrides if text-based classification fails
+        # Context-box fallback override
         if doc_type == "unknown" and user_context:
             if "aadhaar" in user_context or "आधार" in user_context:
                 doc_type = "aadhaar"
@@ -559,12 +535,8 @@ def analyze_document():
             elif "marksheet" in user_context or "10th" in user_context or "ssc" in user_context or "x " in user_context:
                 doc_type = "class_x_marksheet"
         
-        logger.info(f"Classified as: {doc_type}")
-
-        # STEP 3: Extract structured fields
+        # Extract fields
         fields = extract_fields_from_text(extracted_text, doc_type)
-
-        # STEP 4: Build response using hardcoded template + extracted data
         template = DOCUMENT_TEMPLATES.get(doc_type, DOCUMENT_TEMPLATES["unknown"])
         
         response_data = {
