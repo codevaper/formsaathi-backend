@@ -1,10 +1,5 @@
 """
-FormSaathi AI backend.
-
-Given a user question, this service searches the web, scrapes the top
-results for real content, and feeds that context plus the user's profile
-(age, experience level, preferred language, chat history) into an LLM
-whose system prompt adapts tone and depth to that specific user.
+FormSaathi AI Backend — Final Production Build
 """
 
 import os
@@ -26,55 +21,47 @@ from groq import Groq
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("formsaathi")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 
 SEARCH_MAX_RESULTS = 3
 SCRAPE_TIMEOUT_SECONDS = 5
 SCRAPE_CHAR_LIMIT = 2000
-CHAT_HISTORY_TURNS = 6
+CHAT_HISTORY_TURNS = 4
 
-# Temperature raised to 0.6 to prevent repetitive phrasing loops
-LLM_TEMPERATURE = 0.6
-LLM_MAX_TOKENS = 1024
+# HIGH temperature prevents repetition loops
+LLM_TEMPERATURE = 0.7
+LLM_MAX_TOKENS = 800
 MAX_QUERY_LENGTH = 1000
 
-# Cache search context
 CONTEXT_CACHE_TTL_SECONDS = 30 * 60
 _context_cache = {}
 _context_cache_lock = Lock()
 
-# Rate limiting
 RATE_LIMIT_MAX_REQUESTS = 25
 RATE_LIMIT_WINDOW_SECONDS = 60
 _rate_limit_buckets = defaultdict(deque)
 _rate_limit_lock = Lock()
 
-# Verified Active Production-Grade Groq Models (Checked & Updated)
+# ONLY proven, stable models — no experimental ones
 PREFERRED_CHAT_MODELS = [
+    "mixtral-8x7b-32768",
     "llama-3.3-70b-versatile",
     "llama-3.3-70b-specdec",
-    "mixtral-8x7b-32768",      # Highly stable for multilingual outputs
     "llama-3.1-8b-instant"
 ]
-EXCLUDED_MODEL_KEYWORDS = ["whisper", "guard", "audio", "embed", "orpheus", "vision", "tts", "compound"]
+EXCLUDED_MODEL_KEYWORDS = [
+    "whisper", "guard", "audio", "embed", "orpheus",
+    "vision", "tts", "compound", "gpt-oss", "canopy"
+]
 MODEL_CACHE_TTL_SECONDS = 60 * 60
 _model_cache = {"ids": None, "ts": 0}
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-
-# --------------------------------------------------------------------------
-# Small helpers
-# --------------------------------------------------------------------------
 
 def safe_int(value, default):
     try:
@@ -82,10 +69,6 @@ def safe_int(value, default):
     except (TypeError, ValueError):
         return default
 
-
-# --------------------------------------------------------------------------
-# Web search + scrape
-# --------------------------------------------------------------------------
 
 def search_web(query, max_results=SEARCH_MAX_RESULTS):
     results = []
@@ -98,7 +81,7 @@ def search_web(query, max_results=SEARCH_MAX_RESULTS):
                     "snippet": r.get("body", "")
                 })
     except Exception as e:
-        logger.warning("Search failed for %r: %s", query, e)
+        logger.warning("Search failed: %s", e)
     return results
 
 
@@ -109,8 +92,6 @@ def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
             text = trafilatura.extract(downloaded, include_comments=False, include_tables=True)
             if text and len(text.strip()) > 80:
                 return text.strip()[:SCRAPE_CHAR_LIMIT]
-
-        # Fallback to BeautifulSoup
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -166,10 +147,6 @@ def get_context_for_query(query):
     return context, sources, False
 
 
-# --------------------------------------------------------------------------
-# Rate limiting
-# --------------------------------------------------------------------------
-
 def is_rate_limited(client_id):
     now = time.time()
     with _rate_limit_lock:
@@ -182,77 +159,94 @@ def is_rate_limited(client_id):
         return False
 
 
-# --------------------------------------------------------------------------
-# Prompt construction
-# --------------------------------------------------------------------------
+# ======================================================================
+# AGE-SPECIFIC SYSTEM PROMPTS (The Brain of FormSaathi)
+# ======================================================================
 
 def build_system_prompt(profile, language):
     name = profile.get("name") or "User"
     age = safe_int(profile.get("age"), 30)
     ward = profile.get("ward") or "Mumbai"
     experience = profile.get("experience") or "first_time"
-    if experience not in ("first_time", "some", "experienced"):
-        experience = "first_time"
 
-    # 1. Experience Level Directives
-    if experience == "first_time":
-        exp_detail = "NOVICE: The user has never navigated government forms. Define basic terms, explain the 'why', and hold their hand through the process."
-    elif experience == "some":
-        exp_detail = "INTERMEDIATE: The user knows the basics. Skip elementary definitions but provide clear procedural steps."
-    else:  # experienced
-        exp_detail = "EXPERT: The user is highly familiar with government tasks. Skip all explanations. Provide only necessary endpoints, URLs, exact document lists, and fees."
-
-    # 2. Age-Based Tone & Strategy Directives
-    if age >= 60:
-        if experience == "first_time":
-            tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Use very simple language. Prioritize OFFLINE methods (physical office locations, landmarks in Mumbai). Break instructions into small, digestible numbered steps."
-        else:
-            tone = "Respectful (Namaste) and clear. Provide both online links and offline office details in Mumbai. Keep sentences short, readable, and highly polite."
-    elif age >= 35:
-        if experience == "first_time":
-            tone = "Professional, structured, and helpful. Explain how to navigate portals (like Aaple Sarkar) step-by-step. Use clear headings and avoid bureaucratic jargon."
-        else:
-            tone = "Highly concise and professional. Focus strictly on turnaround times (TAT), exact fees, and direct portal links. Do not waste time on pleasantries."
-    else:  # Under 35 (Youth/Young Adult)
-        if experience == "first_time":
-            tone = "Modern, friendly, and encouraging. Recommend digital-first solutions (DigiLocker, mParivahan, online portals). Fast-paced but explanatory."
-        else:
-            tone = "Ultra-crisp, fast, and direct. Zero fluff. Provide checklist formats, direct URLs, and API-like efficiency."
-
-    # 3. Language Directives
+    # --- Language Rule (shared across all ages) ---
     if language == "hi":
-        lang_rule = "ALWAYS respond purely in Hindi (Devanagari script). Use respectful pronouns (आप, जी)."
+        lang_rule = "Respond ONLY in Hindi (Devanagari). Use आप and जी. Never mix English words unless they are official portal names."
     elif language == "mr":
-        lang_rule = "ALWAYS respond purely in Marathi (Devanagari script). Use a warm, culturally respectful tone appropriate for Maharashtra."
+        lang_rule = "Respond ONLY in Marathi (Devanagari). Use warm, respectful Maharashtrian tone."
     elif language == "en":
-        lang_rule = "ALWAYS respond in clear Indian English."
+        lang_rule = "Respond ONLY in clear Indian English."
     else:
-        lang_rule = "AUTO-DETECT the language of the user's question and respond in the EXACT same language (Marathi for Marathi, Hindi for Hindi, etc.)."
+        lang_rule = "Detect the user's language from their question. If they write in Hindi, reply in Hindi. If Marathi, reply in Marathi. If English, reply in English. Never mix languages in one response."
 
-    return f"""You are FormSaathi AI, an intelligent Indian government document and scheme assistant for Mumbai, Maharashtra.
+    # --- Senior Prompt (60+) ---
+    if age >= 60:
+        return f"""You are FormSaathi, a warm and patient government assistant for {name} ji, a senior citizen in {ward}, Mumbai.
 
-USER PROFILE:
-- Name: {name}
-- Age: {age} years old
-- Location: {ward}, Mumbai, Maharashtra
-- Background: {exp_detail}
+LANGUAGE: {lang_rule}
 
-COMMUNICATION STYLE TO ENFORCE:
-- Tone & Strategy: {tone}
-- Language: {lang_rule}
+HOW TO ANSWER:
+- Start with "🙏 नमस्ते {name} ji" or equivalent greeting in the response language
+- Use very short, simple sentences. No jargon. No abbreviations.
+- Give maximum 4-5 numbered steps. Each step = one action only.
+- Always mention the NEAREST physical office with a landmark. Example: "Andheri West BMC office, DN Nagar metro ke paas"
+- List exact documents to carry: "Saath mein ye le jaayein: 1) Aadhaar card asli, 2) 2 photocopy"
+- End with a reassuring line: "Ghabraiye mat, ye kaam bahut aasaan hai."
+- If a photo is needed, say: "Photo lagane ke liye upar Photo Resizer tab use karein"
 
-CRITICAL INSTRUCTIONS:
-1. ADAPT TO THE USER: Strictly apply the Tone and Background rules defined above. Do not talk to a 20-year-old expert the same way you talk to a 70-year-old novice.
-2. BE DIRECT: Answer the question fully and honestly FIRST. Do not refuse to answer.
-3. LOCAL CONTEXT: Include Mumbai-specific office addresses, landmarks, and Maharashtra portals (aaplesarkar.mahaonline.gov.in, mumbaicity.gov.in) when relevant.
-4. PHOTO REQUIREMENT: If a form requires a passport photo, remind them they can use the FormSaathi Photo Resizer tab.
-5. NO INTERNAL MONOLOGUE: Do not output your thinking process. Just output the final, tailored response directly to {name}.
-6. ELIGIBILITY: If applicable, add a brief eligibility note ONLY at the very end of your response."""
+STRICT RULES:
+- NEVER repeat the same sentence twice
+- NEVER show your thinking or reasoning process
+- NEVER say "I am an AI" or "as a language model"
+- Answer the question directly. Do not ask clarifying questions.
+- If you don't know something specific, say so honestly and suggest visiting the nearest Seva Kendra."""
 
+    # --- Youth Prompt (18-34) ---
+    elif age <= 34:
+        return f"""You are FormSaathi, a fast and direct government tech assistant for {name}, a young user in {ward}, Mumbai.
 
-# --------------------------------------------------------------------------
-# Groq model selection + call
-# --------------------------------------------------------------------------
+LANGUAGE: {lang_rule}
+
+HOW TO ANSWER:
+- No greetings, no fluff. Start with the answer immediately.
+- Use bullet points and bold text for key info.
+- Focus on DIGITAL-FIRST: online portals, OTP verification, DigiLocker, mParivahan, UMANG app.
+- Always include: Portal URL, Processing Fee, Turnaround Time (TAT), Required Documents.
+- Format example:
+  **Portal:** nvsp.in
+  **Fee:** ₹0
+  **TAT:** 7 working days
+  **Docs:** Aadhaar, Address Proof, Photo
+- If a photo is needed: "Use the Photo Resizer tab above for compliant photos."
+
+STRICT RULES:
+- NEVER repeat the same sentence twice
+- NEVER show your thinking or reasoning process
+- NEVER say "I am an AI" or "as a language model"
+- Keep total response under 150 words unless the process genuinely needs more detail.
+- Answer the question directly. Do not ask clarifying questions."""
+
+    # --- Standard Prompt (35-59) ---
+    else:
+        return f"""You are FormSaathi, a professional government document assistant for {name} in {ward}, Mumbai.
+
+LANGUAGE: {lang_rule}
+
+HOW TO ANSWER:
+- Start with a brief, polite greeting.
+- Use clear headings: **Eligibility**, **Documents**, **Process**, **Fees**, **Timeline**.
+- Provide both online AND offline options.
+- Include Maharashtra-specific portals: aaplesarkar.mahaonline.gov.in, rto.maharashtra.gov.in
+- Mention the nearest ward office in {ward} when offline steps are involved.
+- If a photo is needed: "You can prepare your photo using the Photo Resizer tab."
+
+STRICT RULES:
+- NEVER repeat the same sentence twice
+- NEVER show your thinking or reasoning process
+- NEVER say "I am an AI" or "as a language model"
+- Be comprehensive but structured. Use formatting to make it scannable.
+- Answer the question directly. Do not ask clarifying questions."""
+
 
 def get_chat_candidates(client):
     now = time.time()
@@ -263,13 +257,15 @@ def get_chat_candidates(client):
         live_ids = {m.id for m in client.models.list().data}
         candidates = [m for m in PREFERRED_CHAT_MODELS if m in live_ids]
         if not candidates:
-            # Safe Fallback to standard chat models on the account
-            candidates = [m for m in live_ids if not any(bad in m.lower() for bad in EXCLUDED_MODEL_KEYWORDS)]
+            candidates = [
+                m.id for m in client.models.list().data
+                if not any(bad in m.id.lower() for bad in EXCLUDED_MODEL_KEYWORDS)
+            ]
         _model_cache["ids"] = candidates
         _model_cache["ts"] = now
         return candidates
     except Exception as e:
-        logger.warning("Could not refresh Groq model list: %s", e)
+        logger.warning("Model list refresh failed: %s", e)
         return _model_cache["ids"] or PREFERRED_CHAT_MODELS
 
 
@@ -283,20 +279,16 @@ def ask_ai(query, context, profile, language, chat_history):
         system_prompt = build_system_prompt(profile, language)
 
         if not context:
-            system_prompt += (
-                "\n\nNOTE: No live web search results are available for this "
-                "answer. Answer from general knowledge, but tell the user to "
-                "verify fees, deadlines, and portal URLs on the official site "
-                "since these can change."
-            )
+            system_prompt += "\n\nNote: No live web data available. Answer from knowledge but tell the user to verify fees and deadlines on official portals."
 
         messages = [{"role": "system", "content": system_prompt}]
+
         if chat_history:
             for msg in chat_history[-CHAT_HISTORY_TURNS:]:
                 messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
 
         if context:
-            messages.append({"role": "user", "content": f"WEB CONTEXT:\n{context}\n\nUSER QUESTION: {query}"})
+            messages.append({"role": "user", "content": f"LIVE WEB DATA:\n{context}\n\nQUESTION: {query}"})
         else:
             messages.append({"role": "user", "content": query})
 
@@ -307,6 +299,9 @@ def ask_ai(query, context, profile, language, chat_history):
                     messages=messages,
                     temperature=LLM_TEMPERATURE,
                     max_tokens=LLM_MAX_TOKENS,
+                    top_p=0.9,
+                    frequency_penalty=0.5,
+                    presence_penalty=0.3
                 )
                 return response.choices[0].message.content, model_id
             except Exception as e:
@@ -314,17 +309,13 @@ def ask_ai(query, context, profile, language, chat_history):
                 continue
 
         if context:
-            return f"**Live Information Found:**\n\n{context[:800]}...\n\n*(Note: AI summary is currently unavailable)*", None
-        return "No specific details found.", None
+            return f"**Live Data Found:**\n\n{context[:800]}...\n\n*(AI summary unavailable — please read sources below)*", None
+        return "No details found. Please try rephrasing your question.", None
 
     except Exception as e:
         logger.error("ask_ai error: %s", e)
         return f"AI Error: {str(e)}", None
 
-
-# --------------------------------------------------------------------------
-# Routes
-# --------------------------------------------------------------------------
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
@@ -339,15 +330,14 @@ def health():
 @app.route("/ask", methods=["POST"])
 def ask():
     start = time.time()
-
     client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
     if is_rate_limited(client_id):
-        return jsonify({"error": "Too many requests. Please wait a moment and try again."}), 429
+        return jsonify({"error": "Too many requests. Please wait."}), 429
 
     try:
         data = request.get_json(silent=True)
         if data is None:
-            return jsonify({"error": "Request body must be valid JSON"}), 400
+            return jsonify({"error": "Invalid JSON"}), 400
 
         query = (data.get("query") or "").strip()
         mode = data.get("mode") or "standard"
@@ -358,7 +348,7 @@ def ask():
         if not query:
             return jsonify({"error": "Missing query"}), 400
         if len(query) > MAX_QUERY_LENGTH:
-            return jsonify({"error": f"Query too long (max {MAX_QUERY_LENGTH} characters)"}), 400
+            return jsonify({"error": f"Query too long (max {MAX_QUERY_LENGTH})"}), 400
 
         if mode == "quick":
             context, sources, from_cache = "", [], False
@@ -367,11 +357,7 @@ def ask():
 
         answer, model_used = ask_ai(query, context, profile, language, chat_history)
 
-        logger.info(
-            "query=%r mode=%s model=%s cache=%s took=%.2fs",
-            query, mode, model_used, from_cache, time.time() - start
-        )
-
+        logger.info("query=%r model=%s cache=%s %.2fs", query, model_used, from_cache, time.time() - start)
         return jsonify({"success": True, "answer": answer, "sources": sources})
 
     except Exception as e:
