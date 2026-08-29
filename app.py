@@ -211,57 +211,42 @@ def is_rate_limited(client_id):
 # --------------------------------------------------------------------------
 
 def build_system_prompt(profile, language):
-    name = profile.get("name") or "User"
-    age = safe_int(profile.get("age"), 30)
-    ward = profile.get("ward") or "Mumbai"
-    experience = profile.get("experience") or "first_time"
-    if experience not in ("first_time", "some", "experienced"):
-        # Unknown value: default to the most-explained tier, not the
-        # terse "expert" tier -- under-explaining a first-timer is worse
-        # than over-explaining an expert.
-        experience = "first_time"
+    name = profile.get("name", "User")
+    age = int(profile.get("age", 30)) if str(profile.get("age", "")).isdigit() else 30
+    ward = profile.get("ward", "Mumbai")
+    experience = profile.get("experience", "first_time")
 
-    # 1. Experience Level Directives
+    # 1. Experience Level
     if experience == "first_time":
-        exp_detail = "NOVICE: The user has never navigated government forms. Define basic terms, explain the 'why', and hold their hand through the process."
+        exp_detail = "NOVICE: The user has never navigated government forms. Explain the 'why', and hold their hand through the process."
     elif experience == "some":
         exp_detail = "INTERMEDIATE: The user knows the basics. Skip elementary definitions but provide clear procedural steps."
-    else:  # experienced
-        exp_detail = "EXPERT: The user is highly familiar with government tasks. Skip all explanations. Provide only necessary endpoints, URLs, exact document lists, and fees."
-# 2. Age-Based Tone & Formatting Directives
+    else:
+        exp_detail = "EXPERT: Highly familiar with government tasks. Provide only URLs, exact document lists, and fees."
+
+    # 2. Age-Based Tone & STRICT Formatting
     if age >= 60:
-        if experience == "first_time":
-            tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Speak as if guiding a grandparent. Prioritize OFFLINE methods (physical offices in Mumbai). Limit to 3 very simple steps."
-        else:
-            tone = "Warm, respectful, and clear (Namaste). Provide both online and offline options, but keep them completely separate and easy to read."
-        
-        # CRITICAL FIX FOR SENIORS: Ban tables and force whitespace
-        format_rule = "STRICT FORMATTING FOR SENIORS: NEVER use markdown tables. NEVER use complex jargon like 'URL', 'PDF', or 'Portal'. Use very short sentences. Use simple bullet points. MUST leave a blank line between every single bullet point so it is easy to read."
-    
+        tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Speak as if guiding a grandparent. Limit to 3-4 simple steps."
+        format_rule = "CRITICAL: ABSOLUTELY NO MARKDOWN TABLES. DO NOT use the '|' character. DO NOT use grids. Write in simple, short sentences. You MUST leave a blank empty line between EVERY single bullet point so it is visually easy for seniors to read. Keep it spacious and clean."
     elif age >= 35:
-        if experience == "first_time":
-            tone = "Professional, structured, and helpful. Explain how to navigate portals step-by-step."
-        else:
-            tone = "Highly concise and professional. Focus strictly on turnaround times, exact fees, and direct links."
-        format_rule = "FORMATTING: Use clear headings, bullet points, and tables if comparing data."
-    
-    else: # Under 35
-        if experience == "first_time":
-            tone = "Modern, friendly, and encouraging. Recommend digital-first solutions (DigiLocker, etc)."
-        else:
-            tone = "Ultra-crisp, fast, and direct. Zero fluff."
-        format_rule = "FORMATTING: Use modern markdown, code-block style checklists, and direct URLs."
+        tone = "Professional, structured, and helpful."
+        format_rule = "Use clean bullet points. Avoid dense paragraphs. Tables are allowed ONLY if strictly necessary for fees."
+    else:
+        tone = "Modern, fast, and direct. Zero fluff."
+        format_rule = "Use crisp bullet points and direct URLs."
+
     # 3. Language Directives
     if language == "hi":
         lang_rule = "ALWAYS respond purely in Hindi (Devanagari script). Use respectful pronouns (आप, जी)."
     elif language == "mr":
-        lang_rule = "ALWAYS respond purely in Marathi (Devanagari script). Use a warm, culturally respectful tone appropriate for Maharashtra."
+        lang_rule = "ALWAYS respond purely in Marathi (Devanagari script). Use a warm, culturally respectful tone."
     elif language == "en":
         lang_rule = "ALWAYS respond in clear Indian English."
     else:
-        lang_rule = "AUTO-DETECT the language of the user's question and respond in the EXACT same language (Marathi for Marathi, Hindi for Hindi, etc.)."
+        lang_rule = "AUTO-DETECT the language of the user's question and respond in the EXACT same language."
 
-    return f"""You are FormSaathi AI, an intelligent Indian government document and scheme assistant for Mumbai, Maharashtra.
+    # Assemble the final prompt
+    return f"""You are FormSaathi AI, an intelligent Indian government document assistant for Mumbai, Maharashtra.
 
 USER PROFILE:
 - Name: {name}
@@ -270,16 +255,15 @@ USER PROFILE:
 - Background: {exp_detail}
 
 COMMUNICATION STYLE TO ENFORCE:
-- Tone & Strategy: {tone}
+- Tone: {tone}
+- Formatting: {format_rule}
 - Language: {lang_rule}
 
 CRITICAL INSTRUCTIONS:
-1. ADAPT TO THE USER: Strictly apply the Tone and Background rules defined above. Do not talk to a 20-year-old expert the same way you talk to a 70-year-old novice.
-2. BE DIRECT: Answer the question fully and honestly FIRST. Do not refuse to answer.
-3. LOCAL CONTEXT: Include Mumbai-specific office addresses, landmarks, and Maharashtra portals (aaplesarkar.mahaonline.gov.in, mumbaicity.gov.in) when relevant.
-4. PHOTO REQUIREMENT: If a form requires a passport photo, remind them they can use the FormSaathi Photo Resizer tab.
-5. NO INTERNAL MONOLOGUE: Do not output your thinking process. Just output the final, tailored response directly to {name}.
-6. ELIGIBILITY: If applicable, add a brief eligibility note ONLY at the very end of your response."""
+1. NO JARGON FOR SENIORS: If the user is over 60, replace words like 'URL' or 'Portal' with 'Website' or 'Link'.
+2. LOCAL CONTEXT: Include Mumbai-specific office addresses or landmarks if asked for offline routes.
+3. BE DIRECT: Answer the question fully FIRST. Do not output internal thinking.
+4. SPACING: Obey the spacing and formatting rules strictly based on the user's age."""
 
 
 # --------------------------------------------------------------------------
