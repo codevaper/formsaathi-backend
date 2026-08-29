@@ -7,4 +7,3 @@ duckduckgo-search==7.5.1
 trafilatura==2.0.0
 beautifulsoup4==4.13.3
 Pillow==11.1.0
-numpy<2.0.0
