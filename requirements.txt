@@ -6,3 +6,4 @@ groq
 duckduckgo-search
 trafilatura
 beautifulsoup4
+Pillow
