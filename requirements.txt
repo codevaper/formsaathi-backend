@@ -2,12 +2,7 @@ flask
 flask-cors
 gunicorn
 requests
-opencv-python-headless
-Pillow
 groq
 duckduckgo-search
 trafilatura
 beautifulsoup4
-numpy
-rembg
-onnxruntime
