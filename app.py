@@ -1,6 +1,6 @@
 """
-FormSaathi AI Backend — Ultimate Stable Production Build
-Endpoints: /ask, /analyze-document, /optimize-document
+FormSaathi AI Backend — Complete Stable Production Build
+Endpoints: /ask, /analyze-document, /optimize-document, /generate-tutorial
 No OpenCV. No NumPy. No Tesseract. No Rembg. Ultra-light for Render.
 """
 
@@ -310,9 +310,10 @@ Return ONLY a valid JSON object with this exact structure (no markdown conversat
   "where_to_submit": "Submission location or portal",
   "important_warnings": [],
   "portal_url": "null or portal url"
-}}{context_hint}"""
+}}{context_hint}
 
-        # Dynamic vision model select
+Be precise. If you cannot read something clearly, say Not visible. Never hallucinate field values."""
+
         try:
             live_ids = {m.id for m in client.models.list().data}
             vision_models = [m for m in VISION_MODELS if m in live_ids] or VISION_MODELS
@@ -351,7 +352,6 @@ def robust_json_parser(raw_text):
     if not raw_text:
         return parsed
 
-    # Try strict loads
     try:
         clean = raw_text.strip()
         if clean.startswith("```"):
@@ -363,44 +363,34 @@ def robust_json_parser(raw_text):
     except Exception as e:
         logger.warning("JSON parse failed, triggering regex fallback: %s", e)
 
-    # Regex Parsing Fallback
     try:
-        # Document Type
         type_match = re.search(r'"document_type"\s*:\s*"([^"]+)"', raw_text)
         parsed["document_type"] = type_match.group(1) if type_match else "Aadhaar Card" if "aadhaar" in raw_text.lower() else "Unknown Document"
 
-        # Document Category
         cat_match = re.search(r'"document_category"\s*:\s*"([^"]+)"', raw_text)
         parsed["document_category"] = cat_match.group(1) if cat_match else "ID Proof"
 
-        # Quality
         qual_match = re.search(r'"quality"\s*:\s*"([^"]+)"', raw_text)
         parsed["quality"] = qual_match.group(1) if qual_match else "Fair"
 
-        # Is Filled
         filled_match = re.search(r'"is_filled"\s*:\s*(true|false)', raw_text, re.IGNORECASE)
         parsed["is_filled"] = filled_match.group(1).lower() == "true" if filled_match else True
 
-        # What is this document
         what_match = re.search(r'"what_is_this_document"\s*:\s*"([^"]+)"', raw_text)
         parsed["what_is_this_document"] = what_match.group(1) if what_match else "A government issued identity card."
 
-        # Where to submit
         where_match = re.search(r'"where_to_submit"\s*:\s*"([^"]+)"', raw_text)
         parsed["where_to_submit"] = where_match.group(1) if where_match else "Official UIDAI online portal or nearest Aadhaar Seva Kendra."
 
-        # Full Text
         text_match = re.search(r'"full_text"\s*:\s*"([^"]+)"', raw_text)
         parsed["full_text"] = text_match.group(1) if text_match else raw_text[:1000]
 
-        # Nested dictionaries & lists extraction...
         parsed["extracted_fields"] = {}
         for k in ["name", "father_name", "date_of_birth", "gender", "address", "id_number", "mobile"]:
             v_match = re.search(fr'"{k}"\s*:\s*"([^"]+)"', raw_text)
             if v_match:
                 parsed["extracted_fields"][k] = v_match.group(1)
 
-        # Lists recovery
         parsed["what_to_do_next"] = re.findall(r'"what_to_do_next"\s*:\s*\[(.*?)\]', raw_text, re.DOTALL)
         if parsed["what_to_do_next"]:
             parsed["what_to_do_next"] = re.findall(r'"([^"]+)"', parsed["what_to_do_next"][0])
@@ -504,8 +494,7 @@ def analyze_document():
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
 
-        # 🧠 KEY OPTIMIZATION: Downscale image to 750px max dimension.
-        # This reduces Groq visual tokens from 4200+ down to <1100, preventing 429 TPM Rate Limits.
+        # Downscale image to 750px max dimension.
         pil_img.thumbnail((750, 750), Image.LANCZOS)
 
         # Enhance contrast slightly to pop the text
@@ -516,9 +505,8 @@ def analyze_document():
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         vision_result = analyze_with_vision(img_b64, context)
-        logger.info("Vision analysis completed. Size returned: %s characters.", len(vision_result) if vision_result else 0)
+        logger.info("Vision analysis completed.")
 
-        # Base clean template
         base_result = {
             "file_size_kb": round(file_size_kb, 2),
             "dimensions": f"{pil_img.width}x{pil_img.height}",
@@ -596,6 +584,76 @@ def optimize_document_route():
 
     except Exception as e:
         logger.error("optimize error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# ======================================================================
+# NEW ENDPOINT: TUTORIAL VIDEO GENERATOR
+# ======================================================================
+@app.route("/generate-tutorial", methods=["POST"])
+def generate_tutorial():
+    try:
+        data = request.get_json(silent=True) or {}
+        form_name = data.get("form_name", "Aadhaar Card Application Form")
+        language = data.get("language") or "en"
+
+        client = Groq(api_key=GROQ_API_KEY)
+
+        # Set instructions language
+        if language == "hi":
+            prompt_lang = "Hindi (Devanagari script)"
+            system_instruction = "Always give steps and instructions in Hindi."
+        elif language == "mr":
+            prompt_lang = "Marathi (Devanagari script)"
+            system_instruction = "Always give steps and instructions in Marathi."
+        else:
+            prompt_lang = "simple Indian English"
+            system_instruction = "Always give steps and instructions in English."
+
+        prompt = f"""Create a highly detailed, step-by-step form-filling tutorial for the: {form_name}.
+The tutorial must be returned strictly in JSON format. Generate exactly 5-6 steps to fill out this form.
+
+Provide instructions in {prompt_lang}. Keep text crisp and short.
+
+Return ONLY a valid JSON list of objects with the exact structure (no markdown conversational wrappers, start directly with open square bracket):
+[
+  {{
+    "step_number": 1,
+    "field_label": "Field/Section name (e.g. 'Full Name' or 'Candidate Name')",
+    "instruction": "Short clear direction on how to write it (e.g., 'Write your name in CAPITAL LETTERS as shown in your leaving certificate.')",
+    "voiceover_text": "What the narrator will speak out loud to guide the user.",
+    "x_pct": X coordinate of this field on a virtual page (0 to 100),
+    "y_pct": Y coordinate of this field on a virtual page (0 to 100),
+    "sample_input": "An example value of what to write (e.g., 'ARUN SHARMA')"
+  }}
+]
+
+Make sure coordinates are logically distributed (e.g., step 1 near top of page, step 6 near bottom)."""
+
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",  # Ultra-fast text generation
+            messages=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=1000
+        )
+        
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw)
+
+        json_match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if json_match:
+            steps = json.loads(json_match.group())
+            return jsonify({"success": True, "steps": steps})
+        
+        return jsonify({"error": "Failed to generate structured tutorial."}), 500
+
+    except Exception as e:
+        logger.error("tutorial error: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
