@@ -1,5 +1,5 @@
 """
-FormSaathi AI Backend — Complete Stable Production Build
+FormSaathi AI Unified Backend — Production Build
 Endpoints: /ask, /analyze-document, /optimize-document, /generate-tutorial
 No OpenCV. No NumPy. No Tesseract. No Rembg. Ultra-light for Render.
 """
@@ -265,7 +265,7 @@ STRICT RULES:
 
 
 # ======================================================================
-# SMART DOCUMENT VISION ANALYZER WITH ROBUST PARSING
+# SMART DOCUMENT VISION ANALYZER WITH ROBUST PARSING (Refined 1024px Engine)
 # ======================================================================
 def analyze_with_vision(image_base64, user_context=""):
     if not GROQ_API_KEY:
@@ -274,45 +274,25 @@ def analyze_with_vision(image_base64, user_context=""):
         client = Groq(api_key=GROQ_API_KEY)
         context_hint = f"\nUser context: {user_context}" if user_context else ""
 
-        prompt = f"""You are an expert Indian government document analyzer. Analyze this document image deeply.
+        prompt = f"""You are an expert Indian government document analyzer. Extract the text and verify this document image.
 
-Return ONLY a valid JSON object with this exact structure (no markdown conversational wrappers, no formatting, start directly with open curly brace):
+If this is an Aadhaar Card, PAN Card, Voter ID, Income Certificate, or Class 10 (X) Marksheet, make sure you extract the corresponding identifier keys with high precision.
+
+Return ONLY a valid JSON object. Do not include markdown wraps or conversational introduction. Start directly with the open bracket.
+
 {{
-  "document_type": "Aadhaar Card / Voter ID / PAN Card / Passport / Birth Certificate / Income Certificate / Domicile Certificate / General Form / unknown",
-  "document_category": "ID Proof / Address Proof / Income Proof / Educational / Application Form / Government Scheme / unknown",
-  "language": "Hindi / English / Marathi / Mixed / unknown",
+  "document_type": "Aadhaar Card / Income Certificate / Class X Marksheet / PAN Card / Voter ID / Passport / Driving License / Unknown",
   "quality": "Good / Fair / Poor",
-  "is_filled": true or false,
-  "extracted_fields": {{
-    "name": "full name or Not visible",
-    "father_name": "father name or Not visible",
-    "date_of_birth": "DOB or Not visible",
-    "gender": "gender or Not visible",
-    "address": "full address or Not visible",
-    "id_number": "ID number masked or Not visible",
-    "issue_date": "issue date or Not visible",
-    "expiry_date": "expiry date or Not visible",
-    "mobile": "mobile or Not visible",
-    "email": "email or Not visible"
-  }},
-  "full_text": "Extract ALL readable text from this document",
-  "completeness_check": {{
-    "missing_fields": [],
-    "missing_signature": false,
-    "missing_photo": false,
-    "missing_stamp": false
-  }},
-  "what_is_this_document": "2 sentence explanation of what this document is",
-  "what_to_do_next": [
-    "Step 1...",
-    "Step 2..."
-  ],
-  "where_to_submit": "Submission location or portal",
-  "important_warnings": [],
-  "portal_url": "null or portal url"
-}}{context_hint}
-
-Be precise. If you cannot read something clearly, say Not visible. Never hallucinate field values."""
+  "name": "Full Name as printed on the document or Not visible",
+  "father_or_spouse_name": "Father or Spouse name or Not visible",
+  "date_of_birth": "DOB (e.g. DD/MM/YYYY) or Not visible",
+  "gender": "Male / Female / Other / Not visible",
+  "address": "Full address or Not visible",
+  "id_number": "Show only the last 4 digits (e.g. XXXX-XXXX-1234 for Aadhaar, Certificate Numbers, or Roll Numbers)",
+  "full_text": "Extract ALL readable letters and numbers verbatim from the document for OCR lookup.",
+  "what_is_this_document": "A 1-sentence simple description of what this document is and what government authority issued it.",
+  "where_to_submit": "Tell the user exactly which portals or local government desks usually require this document."
+}}{context_hint}"""
 
         try:
             live_ids = {m.id for m in client.models.list().data}
@@ -334,7 +314,7 @@ Be precise. If you cannot read something clearly, say Not visible. Never halluci
                         ]
                     }],
                     temperature=0.1,
-                    max_tokens=1500
+                    max_tokens=1024
                 )
                 return response.choices[0].message.content
             except Exception as e:
@@ -347,7 +327,7 @@ Be precise. If you cannot read something clearly, say Not visible. Never halluci
 
 
 def robust_json_parser(raw_text):
-    """Regex recovery engine if LLM JSON parsing fails"""
+    """Fallback Regex parsing parser to prevent JSON structure anomalies"""
     parsed = {}
     if not raw_text:
         return parsed
@@ -361,48 +341,42 @@ def robust_json_parser(raw_text):
         if json_match:
             return json.loads(json_match.group())
     except Exception as e:
-        logger.warning("JSON parse failed, triggering regex fallback: %s", e)
+        logger.warning("JSON parsing anomaly. Starting regex parser.")
 
     try:
         type_match = re.search(r'"document_type"\s*:\s*"([^"]+)"', raw_text)
-        parsed["document_type"] = type_match.group(1) if type_match else "Aadhaar Card" if "aadhaar" in raw_text.lower() else "Unknown Document"
+        parsed["document_type"] = type_match.group(1) if type_match else "Unknown Document"
 
-        cat_match = re.search(r'"document_category"\s*:\s*"([^"]+)"', raw_text)
-        parsed["document_category"] = cat_match.group(1) if cat_match else "ID Proof"
+        # Auto classification if LLM drops out
+        if "aadhaar" in raw_text.lower():
+            parsed["document_type"] = "Aadhaar Card"
+        elif "income" in raw_text.lower() or "tahsildar" in raw_text.lower():
+            parsed["document_type"] = "Income Certificate"
+        elif "marksheet" in raw_text.lower() or "secondary school" in raw_text.lower() or "marks statement" in raw_text.lower():
+            parsed["document_type"] = "Class X Marksheet"
 
         qual_match = re.search(r'"quality"\s*:\s*"([^"]+)"', raw_text)
         parsed["quality"] = qual_match.group(1) if qual_match else "Fair"
 
-        filled_match = re.search(r'"is_filled"\s*:\s*(true|false)', raw_text, re.IGNORECASE)
-        parsed["is_filled"] = filled_match.group(1).lower() == "true" if filled_match else True
-
         what_match = re.search(r'"what_is_this_document"\s*:\s*"([^"]+)"', raw_text)
-        parsed["what_is_this_document"] = what_match.group(1) if what_match else "A government issued identity card."
+        parsed["what_is_this_document"] = what_match.group(1) if what_match else "Identified government issued document."
 
         where_match = re.search(r'"where_to_submit"\s*:\s*"([^"]+)"', raw_text)
-        parsed["where_to_submit"] = where_match.group(1) if where_match else "Official UIDAI online portal or nearest Aadhaar Seva Kendra."
+        parsed["where_to_submit"] = where_match.group(1) if where_match else "Verify submission endpoints on official guidelines."
 
         text_match = re.search(r'"full_text"\s*:\s*"([^"]+)"', raw_text)
-        parsed["full_text"] = text_match.group(1) if text_match else raw_text[:1000]
+        parsed["full_text"] = text_match.group(1) if text_match else raw_text[:500]
 
         parsed["extracted_fields"] = {}
-        for k in ["name", "father_name", "date_of_birth", "gender", "address", "id_number", "mobile"]:
+        for k in ["name", "father_or_spouse_name", "date_of_birth", "gender", "address", "id_number"]:
             v_match = re.search(fr'"{k}"\s*:\s*"([^"]+)"', raw_text)
             if v_match:
                 parsed["extracted_fields"][k] = v_match.group(1)
 
-        parsed["what_to_do_next"] = re.findall(r'"what_to_do_next"\s*:\s*\[(.*?)\]', raw_text, re.DOTALL)
-        if parsed["what_to_do_next"]:
-            parsed["what_to_do_next"] = re.findall(r'"([^"]+)"', parsed["what_to_do_next"][0])
-        else:
-            parsed["what_to_do_next"] = ["Verify details match official data", "Apply online on portal"]
-
-        parsed["important_warnings"] = ["Make sure Aadhaar details are updated"]
-
     except Exception as err:
-        logger.error("Regex recovery failed completely: %s", err)
-        parsed["document_type"] = "Analysis Failed"
-        parsed["full_text"] = raw_text[:500]
+        logger.error("All parsers failed: %s", err)
+        parsed["document_type"] = "Unreadable Image"
+        parsed["full_text"] = raw_text[:200]
 
     return parsed
 
@@ -494,45 +468,52 @@ def analyze_document():
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
 
-        # Downscale image to 750px max dimension.
-        pil_img.thumbnail((750, 750), Image.LANCZOS)
+        # 🧠 KEY TILE RESOLUTION MATCH (1024px width max dimension)
+        # Prevents Llama 3.2 Vision from tiling images too large, while retaining razor text
+        pil_img.thumbnail((1024, 1024), Image.LANCZOS)
 
-        # Enhance contrast slightly to pop the text
-        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.15)
+        # Enhance Sharpness and Contrast for tiny numbers & ink stamps
+        pil_img = ImageEnhance.Sharpness(pil_img).enhance(2.0)
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.3)
 
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=85)
+        pil_img.save(buf, format="JPEG", quality=75) 
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         vision_result = analyze_with_vision(img_b64, context)
         logger.info("Vision analysis completed.")
 
+        # Unified Frontend Mapping template
         base_result = {
             "file_size_kb": round(file_size_kb, 2),
             "dimensions": f"{pil_img.width}x{pil_img.height}",
             "document_type": "Unknown Document",
-            "document_category": "ID Proof",
-            "language": "English/Hindi",
-            "quality": "Good",
-            "is_filled": True,
+            "quality": "Unknown",
             "extracted_fields": {},
             "full_text": "",
-            "completeness_check": {
-                "missing_fields": [],
-                "missing_signature": False,
-                "missing_photo": False,
-                "missing_stamp": False
-            },
-            "what_is_this_document": "",
-            "what_to_do_next": [],
-            "where_to_submit": "",
-            "important_warnings": [],
-            "portal_url": None
+            "what_is_this_document": "Processing failed.",
+            "where_to_submit": ""
         }
 
         if vision_result:
             parsed = robust_json_parser(vision_result)
-            base_result.update(parsed)
+            
+            base_result["document_type"] = parsed.get("document_type", "Unknown Document")
+            base_result["quality"] = parsed.get("quality", "Fair")
+            base_result["full_text"] = parsed.get("full_text", "")
+            base_result["what_is_this_document"] = parsed.get("what_is_this_document", "")
+            base_result["where_to_submit"] = parsed.get("where_to_submit", "")
+            
+            # Map fields properly to frontend DocumentTools
+            fields = parsed.get("extracted_fields", {})
+            base_result["extracted_fields"] = {
+                "Name": fields.get("name", parsed.get("name", "Not visible")),
+                "Relative/Spouse Name": fields.get("father_or_spouse_name", parsed.get("father_or_spouse_name", "Not visible")),
+                "DOB": fields.get("date_of_birth", parsed.get("date_of_birth", "Not visible")),
+                "Gender": fields.get("gender", parsed.get("gender", "Not visible")),
+                "ID Number": fields.get("id_number", parsed.get("id_number", "Not visible")),
+                "Address": fields.get("address", parsed.get("address", "Not visible"))
+            }
 
         return jsonify({"success": True, **base_result})
 
@@ -588,7 +569,7 @@ def optimize_document_route():
 
 
 # ======================================================================
-# NEW ENDPOINT: TUTORIAL VIDEO GENERATOR
+# TUTORIAL VIDEO GENERATOR
 # ======================================================================
 @app.route("/generate-tutorial", methods=["POST"])
 def generate_tutorial():
@@ -599,7 +580,6 @@ def generate_tutorial():
 
         client = Groq(api_key=GROQ_API_KEY)
 
-        # Set instructions language
         if language == "hi":
             prompt_lang = "Hindi (Devanagari script)"
             system_instruction = "Always give steps and instructions in Hindi."
@@ -631,7 +611,7 @@ Return ONLY a valid JSON list of objects with the exact structure (no markdown c
 Make sure coordinates are logically distributed (e.g., step 1 near top of page, step 6 near bottom)."""
 
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",  # Ultra-fast text generation
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt}
