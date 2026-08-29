@@ -1,15 +1,17 @@
 """
-FormSaathi AI Backend — Production Stable Build
-Endpoints: /ask, /analyze-document, /optimize-document, /generate-tutorial
+FormSaathi AI Backend — Complete Stable Production Build
+Endpoints: /ask, /analyze-document, /optimize-document, /generate-tutorial, /process-photo
 """
 
-import os, io, time, base64, logging, re, json
+import os, io, time, base64, logging, re, json, math
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
 import requests
 import trafilatura
+import numpy as np
+import cv2
 from bs4 import BeautifulSoup
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from flask import Flask, request, jsonify
@@ -143,13 +145,10 @@ def classify_document(text):
     if not text: return "unknown"
     text_lower = text.lower()
     
-    # Aadhaar patterns
     if any(kw in text_lower for kw in ["unique identification", "uidai", "आधार", "aadhaar", "भारत सरकार"]) or re.search(r'\b\d{4}\s?\d{4}\s?\d{4}\b', text):
         return "aadhaar"
-    # Income Certificate patterns
     if any(kw in text_lower for kw in ["income certificate", "आय प्रमाण", "उत्पन्न दाखला", "tahsildar", "annual income", "वार्षिक आय"]):
         return "income_certificate"
-    # Class X Marksheet patterns
     if any(kw in text_lower for kw in ["secondary school", "ssc", "class x", "class 10", "marks obtained", "marks statement", "grade sheet", "marksheet", "roll no"]):
         return "class_x_marksheet"
     return "unknown"
@@ -461,7 +460,6 @@ def analyze_document():
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
         original_dims = f"{pil_img.width}x{pil_img.height}"
         
-        # Keep image dimensions at 1024 max for Llama, sharpen for readability
         pil_img.thumbnail((1024, 1024), Image.LANCZOS)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
         pil_img = ImageEnhance.Contrast(pil_img).enhance(1.3)
@@ -505,7 +503,7 @@ def analyze_document():
         return jsonify(response_data)
 
     except Exception as e:
-        logger.error(f"analyze error: {e}")
+        logger.error(f"analyze error: %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -599,6 +597,105 @@ Return ONLY a valid JSON list of 5-6 steps:
 
     except Exception as e:
         logger.error("tutorial error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+
+# ==================== NEW: STABLE PORTRAIT FACIAL CROP ====================
+@app.route("/process-photo", methods=["POST"])
+def process_photo():
+    if "photo" not in request.files:
+        return jsonify({"error": "No photo uploaded"}), 400
+
+    try:
+        photo_file = request.files["photo"]
+        doc_type = request.form.get("doc_type", "aadhaar")
+        
+        # Correct auto-exif orientation
+        pil_img = Image.open(photo_file.stream)
+        pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+
+        # Specific Target Form Dimensions Map
+        SIZES = {
+            "aadhaar": (413, 531),
+            "driving_license": (413, 531),
+            "voter_id": (413, 531),
+            "income_certificate": (160, 212),
+            "domicile_certificate": (160, 212),
+        }
+        tw, th = SIZES.get(doc_type, (413, 531))
+        target_ratio = tw / th
+
+        # Convert to numpy array for OpenCV Processing
+        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+
+        # Execute Haar Cascade frontal face detector
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = face_cascade.detectMultiScale(gray, 1.12, 5, minSize=(60, 60))
+
+        faces_detected = len(faces)
+        
+        if faces_detected > 0:
+            # Crop around the largest detected face
+            x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+            
+            # Apply strict standard studio pad limits (70-80% coverage)
+            pad_x = int(w * 0.75)
+            pad_y = int(h * 1.15)
+            
+            x1 = max(0, x - pad_x)
+            y1 = max(0, y - pad_y)
+            x2 = min(pil_img.width, x + w + pad_x)
+            y2 = min(pil_img.height, y + h + int(h * 0.6))
+
+            crop_w = x2 - x1
+            crop_h = y2 - y1
+            crop_ratio = crop_w / crop_h
+
+            if crop_ratio > target_ratio:
+                new_w = int(crop_h * target_ratio)
+                x1 += (crop_w - new_w) // 2
+                x2 = x1 + new_w
+            else:
+                new_h = int(crop_w / target_ratio)
+                y1 += (crop_h - new_h) // 2
+                y2 = y1 + new_h
+
+            cropped_img = pil_img.crop((x1, y1, x2, y2))
+        else:
+            # Safe Fallback to clean aspect-correct center crop
+            w, h = pil_img.size
+            if (w / h) > target_ratio:
+                new_w = int(h * target_ratio)
+                x1 = (w - new_w) // 2
+                cropped_img = pil_img.crop((x1, 0, x1 + new_w, h))
+            else:
+                new_h = int(w / target_ratio)
+                y1 = (h - new_h) // 2
+                cropped_img = pil_img.crop((0, y1, w, y1 + new_h))
+
+        # Resize to specified exact dimensions
+        cropped_img = cropped_img.resize((tw, th), Image.LANCZOS)
+
+        # Enhance photo for premium print-ready quality
+        cropped_img = ImageEnhance.Contrast(cropped_img).enhance(1.1)
+        cropped_img = ImageEnhance.Sharpness(cropped_img).enhance(1.2)
+
+        # Base64 Encode JPEG response
+        buf = io.BytesIO()
+        cropped_img.save(buf, format="JPEG", quality=90)
+        b64_str = base64.decodebytes(buf.getvalue() if hasattr(base64, 'decodebytes') else base64.b64encode(buf.getvalue()))
+        b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        return jsonify({
+            "success": True,
+            "processed_image_base64": b64_str,
+            "dimensions": f"{tw}x{th} px",
+            "faces_detected": faces_detected
+        })
+
+    except Exception as e:
+        logger.error(f"process-photo failed: {e}")
         return jsonify({"error": str(e)}), 500
 
 
