@@ -1,6 +1,6 @@
 """
-FormSaathi AI Backend — Dynamic Vision Auto-Discovery Edition
-Automatically queries active Groq vision models at runtime.
+FormSaathi AI Backend — Production Stable Build
+Endpoints: /ask, /analyze-document, /optimize-document, /generate-tutorial
 """
 
 import os, io, time, base64, logging, re, json
@@ -49,6 +49,11 @@ PREFERRED_CHAT_MODELS = [
     "llama-3.1-8b-instant"
 ]
 
+VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview"
+]
+
 EXCLUDED_MODEL_KEYWORDS = [
     "whisper", "guard", "audio", "embed", "orpheus",
     "tts", "compound", "gpt-oss", "canopy"
@@ -78,61 +83,53 @@ DOCUMENT_TEMPLATES = {
             "Link your Aadhaar with PAN, bank account, and mobile number if not done",
             "Download digital copy (e-Aadhaar) from myaadhaar.uidai.gov.in for backup"
         ],
-        "where_to_submit": "Aadhaar is accepted at: Banks, Passport office, RTO, Income Tax office, all government scheme applications, EPFO, DigiLocker, PAN application (Form 49A), scholarships, ration card, and gas connection.",
+        "where_to_submit": "Banks, Passport office, RTO, Income Tax office, all government scheme applications, DigiLocker, PAN application.",
         "portal_url": "https://myaadhaar.uidai.gov.in",
         "important_warnings": [
             "Never share your full Aadhaar number publicly on social media",
-            "Always mask first 8 digits when sharing photocopy (use masked Aadhaar from UIDAI portal)",
-            "Check biometric lock status at resident.uidai.gov.in to prevent misuse"
+            "Always mask first 8 digits when sharing photocopies"
         ]
     },
     "income_certificate": {
         "document_type": "Income Certificate",
         "document_category": "Income Proof",
         "issuing_authority": "Tahsildar / SDM / Revenue Department (State Government)",
-        "what_is_this_document": "An Income Certificate is an official document issued by state revenue authorities (Tahsildar/SDM) certifying the annual income of a family. It is required for availing income-based government benefits, scholarships, and reservation quotas.",
+        "what_is_this_document": "An Income Certificate is an official document issued by state revenue authorities certifying the annual income of a family. It is required for availing income-based government benefits, scholarships, and reservation quotas.",
         "what_to_do_next": [
             "Verify the issue date — most Income Certificates are valid for only 1 year",
-            "Check that the annual income amount matches your ITR or salary slips",
             "Ensure the Tahsildar signature and government seal are clearly visible",
-            "Keep 3-4 photocopies + digital scan for scholarship, admission, and job applications"
+            "Keep 3-4 photocopies + digital scan for scholarship and college admission applications"
         ],
-        "where_to_submit": "Required for: College/University scholarships (EWS, OBC, SC/ST), Government job applications under reserved category, PM Vishwakarma Yojana, PMAY housing scheme, education loan applications, and hostel fee concessions.",
+        "where_to_submit": "College/University scholarships (EWS, OBC, SC/ST), Government job applications, and fee concessions.",
         "portal_url": "https://aaplesarkar.mahaonline.gov.in (Maharashtra) or your state's e-district portal",
         "important_warnings": [
-            "Income Certificate expires 1 year from issue date — renew before applying",
-            "Amount in words and figures must match exactly",
-            "Do not submit if Tahsildar's stamp or signature is unclear"
+            "Income Certificate expires 1 year from issue date — renew before applying"
         ]
     },
     "class_x_marksheet": {
-        "document_type": "Class X (SSC/CBSE/ICSE) Marksheet",
+        "document_type": "Class X (SSC/CBSE) Marksheet",
         "document_category": "Educational Certificate",
-        "issuing_authority": "State Board (SSC) / CBSE / ICSE / Other State Boards",
-        "what_is_this_document": "The Class X Marksheet is an official academic document showing marks obtained in the Secondary School Certificate examination. It is a permanent educational record used as proof of date of birth, qualification, and academic performance for higher education and government jobs.",
+        "issuing_authority": "State Board (SSC) / CBSE / ICSE Boards",
+        "what_is_this_document": "The Class X Marksheet is an official academic document showing marks obtained in the secondary school examinations. It is widely used as a permanent proof of birth date (DOB).",
         "what_to_do_next": [
-            "Cross-check your name, roll number, and DOB spelling matches Aadhaar",
-            "Get 5-6 attested photocopies from a gazetted officer for future use",
-            "Register on DigiLocker (digilocker.gov.in) to get verified digital copy",
-            "Keep original safe — required for Class 11, college admission, passport, and government jobs"
+            "Cross-check your name, roll number, and DOB spelling matches Aadhaar exactly",
+            "Register on DigiLocker to pull your verified digital marksheet copy",
+            "Keep original safe — required for college admissions, passports, and higher education enrollment"
         ],
-        "where_to_submit": "Required for: Class 11/Junior College admission, Diploma/ITI courses, Government job applications (SSC, Railway, Police), Passport application (as DOB proof), Driving License (age proof), Scholarship applications, and NEET/JEE registration.",
-        "portal_url": "https://www.digilocker.gov.in (for verified digital copy)",
+        "where_to_submit": "College admissions, Passport application (DOB proof), Driving License, and scholarship schemes.",
+        "portal_url": "https://www.digilocker.gov.in",
         "important_warnings": [
-            "Original marksheet is issued only ONCE — never laminate the original",
-            "For duplicate, apply to your Board with FIR copy if lost",
-            "Verify hologram and board seal — fake marksheets are punishable"
+            "Never laminate the original marksheet if it contains active holograms"
         ]
     },
     "unknown": {
-        "document_type": "Document Uploaded",
-        "document_category": "General Document",
+        "document_type": "General Document",
+        "document_category": "General Proof",
         "issuing_authority": "Government / Educational Authority",
-        "what_is_this_document": "This document was uploaded successfully and is being processed for verification.",
+        "what_is_this_document": "This document was uploaded successfully and is being verified.",
         "what_to_do_next": [
-            "Ensure all 4 borders of the document are visible",
             "Keep digital and printed copies ready for portal submission",
-            "Use the context box to specify the exact document type if needed"
+            "Ensure the image has clear contrast and is easily legible"
         ],
         "where_to_submit": "Official state or central government portal",
         "portal_url": None,
@@ -143,61 +140,33 @@ DOCUMENT_TEMPLATES = {
 
 # ==================== DOCUMENT CLASSIFIER (Regex-based) ====================
 def classify_document(text):
-    if not text:
-        return "unknown"
-    
+    if not text: return "unknown"
     text_lower = text.lower()
     
-    # AADHAAR
-    aadhaar_keywords = [
-        "unique identification authority", "uidai", "आधार", "aadhaar",
-        "government of india", "भारत सरकार", "help@uidai.gov.in"
-    ]
-    aadhaar_hits = sum(1 for kw in aadhaar_keywords if kw in text_lower)
-    has_aadhaar_number = bool(re.search(r'\b\d{4}\s?\d{4}\s?\d{4}\b', text))
-    if aadhaar_hits >= 1 or has_aadhaar_number:
+    # Aadhaar patterns
+    if any(kw in text_lower for kw in ["unique identification", "uidai", "आधार", "aadhaar", "भारत सरकार"]) or re.search(r'\b\d{4}\s?\d{4}\s?\d{4}\b', text):
         return "aadhaar"
-    
-    # INCOME CERTIFICATE
-    income_keywords = [
-        "income certificate", "आय प्रमाण", "उत्पन्न दाखला",
-        "tahsildar", "तहसीलदार", "annual income", "वार्षिक आय",
-        "revenue department", "certified that", "rupees per annum"
-    ]
-    income_hits = sum(1 for kw in income_keywords if kw in text_lower)
-    if income_hits >= 1:
+    # Income Certificate patterns
+    if any(kw in text_lower for kw in ["income certificate", "आय प्रमाण", "उत्पन्न दाखला", "tahsildar", "annual income", "वार्षिक आय"]):
         return "income_certificate"
-    
-    # CLASS X MARKSHEET
-    marksheet_keywords = [
-        "secondary school certificate", "ssc", "class x", "class 10",
-        "cbse", "icse", "board of secondary", "माध्यमिक", "marks obtained",
-        "marks statement", "grade sheet", "roll no", "roll number", "seat no",
-        "subject", "theory", "practical", "marksheet", "passing certificate"
-    ]
-    marksheet_hits = sum(1 for kw in marksheet_keywords if kw in text_lower)
-    if marksheet_hits >= 1:
+    # Class X Marksheet patterns
+    if any(kw in text_lower for kw in ["secondary school", "ssc", "class x", "class 10", "marks obtained", "marks statement", "grade sheet", "marksheet", "roll no"]):
         return "class_x_marksheet"
-    
     return "unknown"
 
 
 # ==================== FIELD EXTRACTOR (Regex-based) ====================
 def extract_fields_from_text(text, doc_type):
     fields = {}
-    if not text:
-        return fields
+    if not text: return fields
     
-    # Aadhaar Number
     if doc_type == "aadhaar":
         aadhaar_match = re.search(r'\b(\d{4})\s?(\d{4})\s?(\d{4})\b', text)
         if aadhaar_match:
             fields["ID Number"] = f"XXXX XXXX {aadhaar_match.group(3)}"
-    
-    # DOB
+            
     dob_patterns = [
         r'(?:DOB|Date of Birth|जन्म तिथि|D\.O\.B)[:\s]*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
-        r'(?:Year of Birth|YOB)[:\s]*(\d{4})',
         r'\b(\d{2}[/-]\d{2}[/-]\d{4})\b'
     ]
     for pattern in dob_patterns:
@@ -205,13 +174,11 @@ def extract_fields_from_text(text, doc_type):
         if m:
             fields["Date of Birth"] = m.group(1)
             break
-    
-    # Gender
+            
     gender_match = re.search(r'\b(MALE|FEMALE|पुरुष|महिला|Male|Female)\b', text)
     if gender_match:
         fields["Gender"] = gender_match.group(1).title()
-    
-    # Name
+        
     name_patterns = [
         r'(?:Name|नाम|Candidate Name)[:\s]+([A-Z][A-Z\s]{2,40})',
         r'(?:Name|नाम)[:\s]+([A-Za-z][A-Za-z\s]{2,40})',
@@ -221,65 +188,45 @@ def extract_fields_from_text(text, doc_type):
         if m:
             fields["Name"] = m.group(1).strip()
             break
-    
-    # Class X Marksheet specific
+            
     if doc_type == "class_x_marksheet":
-        roll_match = re.search(r'(?:Roll No|Seat No|Roll Number|Reg No)[:\s\.]+([A-Z0-9]{4,15})', text, re.IGNORECASE)
-        if roll_match:
-            fields["Roll Number"] = roll_match.group(1)
-        
+        roll_match = re.search(r'(?:Roll No|Seat No|Roll Number)[:\s\.]+([A-Z0-9]{4,15})', text, re.IGNORECASE)
+        if roll_match: fields["Roll Number"] = roll_match.group(1)
         pct_match = re.search(r'(\d{2,3}(?:\.\d{1,2})?)\s*%', text)
-        if pct_match:
-            fields["Percentage"] = pct_match.group(1) + "%"
-    
-    # Income Certificate specific
+        if pct_match: fields["Percentage"] = pct_match.group(1) + "%"
+        
     if doc_type == "income_certificate":
         income_match = re.search(r'(?:Rs\.?|₹|Rupees)[\s]*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)', text)
-        if income_match:
-            fields["Annual Income"] = "₹ " + income_match.group(1)
-            
-        cert_match = re.search(r'(?:Certificate No|Cert No|प्रमाणपत्र क्रमांक)[:\s\.]+([A-Z0-9/-]{5,25})', text, re.IGNORECASE)
-        if cert_match:
-            fields["Certificate Number"] = cert_match.group(1)
-    
+        if income_match: fields["Annual Income"] = "₹ " + income_match.group(1)
+        cert_match = re.search(r'(?:Certificate No|Cert No)[:\s\.]+([A-Z0-9/-]{5,25})', text, re.IGNORECASE)
+        if cert_match: fields["Certificate Number"] = cert_match.group(1)
+        
     return fields
 
 
-# ==================== DYNAMIC VISION MODEL FETCHER ====================
+# ==================== DYNAMIC VISION MODEL DISCOVERY ====================
 def get_live_vision_models(client):
-    """Dynamically discover which vision models are active in the user's Groq account."""
     now = time.time()
     if _vision_model_cache["ids"] and (now - _vision_model_cache["ts"] < 3600):
         return _vision_model_cache["ids"]
-    
     try:
         live_models = [m.id for m in client.models.list().data]
-        logger.info(f"Available Groq models on account: {live_models}")
-        
-        # Look for any live models that support vision
-        vision_candidates = [m for m in live_models if "vision" in m.lower() or "vl" in m.lower() or "llava" in m.lower()]
-        
+        vision_candidates = [m for m in live_models if "vision" in m.lower()]
         if not vision_candidates:
-            # Fallback list of known active vision IDs
             vision_candidates = ["llama-3.2-11b-vision-preview"]
-            
         _vision_model_cache["ids"] = vision_candidates
         _vision_model_cache["ts"] = now
-        logger.info(f"Active vision candidates selected: {vision_candidates}")
         return vision_candidates
-    except Exception as e:
-        logger.warning(f"Could not dynamically query models: {e}")
+    except Exception:
         return ["llama-3.2-11b-vision-preview"]
 
 
-# ==================== GROQ VISION (Safe & Dynamic) ====================
+# ==================== GROQ VISION API CALL ====================
 def extract_text_with_vision(image_base64):
-    if not GROQ_API_KEY:
-        return None
+    if not GROQ_API_KEY: return None
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        prompt = "Read this document image and extract ALL visible text verbatim. Include all names, numbers, marks, roll numbers, dates, and labels exactly as they appear."
-        
+        prompt = "Read this document image and extract ALL visible text verbatim. Do not summarize or explain."
         vision_models = get_live_vision_models(client)
         
         for model_id in vision_models:
@@ -290,28 +237,23 @@ def extract_text_with_vision(image_base64):
                         "role": "user",
                         "content": [
                             {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
-                            }}
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
                         ]
                     }],
                     temperature=0.0,
                     max_tokens=2000
                 )
-                text = response.choices[0].message.content
-                logger.info(f"Vision model '{model_id}' successfully extracted {len(text)} chars.")
-                return text
+                return response.choices[0].message.content
             except Exception as e:
-                logger.warning(f"Vision model '{model_id}' failed: {e}")
+                logger.warning(f"Vision model {model_id} failed: {e}")
                 continue
-                
         return None
     except Exception as e:
-        logger.error(f"Vision extraction global error: {e}")
+        logger.error(f"Vision extraction error: {e}")
         return None
 
 
-# ==================== SCRAPER & CHAT ====================
+# ==================== CHAT SCRAPER & AI ====================
 def search_web(query, max_results=SEARCH_MAX_RESULTS):
     results = []
     try:
@@ -429,14 +371,14 @@ def build_system_prompt(profile, language):
         lang_rule = "Detect the user's language and respond in the same language."
 
     if age >= 60:
-        return f"You are FormSaathi for {name} ji, senior citizen in {ward}. LANGUAGE: {lang_rule}. Simple sentences, 4-5 numbered steps, nearest office with landmark."
+        return f"You are FormSaathi for {name} ji, senior citizen in {ward}. LANGUAGE: {lang_rule}. Simple sentences, 4-5 steps, nearest office with landmark."
     elif age <= 34:
-        return f"You are FormSaathi for {name} in {ward}. LANGUAGE: {lang_rule}. No fluff, bullet points, digital-first. Include Portal, Fee, TAT, Docs. Under 150 words."
+        return f"You are FormSaathi for {name} in {ward}. LANGUAGE: {lang_rule}. Direct bullet points, digital-first. Portal, Fee, TAT, Docs. Under 150 words."
     else:
-        return f"You are FormSaathi for {name} in {ward}. LANGUAGE: {lang_rule}. Use headings Eligibility, Documents, Process, Fees, Timeline. Both online and offline."
+        return f"You are FormSaathi for {name} in {ward}. LANGUAGE: {lang_rule}. Use headings Eligibility, Documents, Process, Fees, Timeline. Online and offline."
 
 
-# ==================== ROUTES ====================
+# ==================== MAIN ENDPOINTS ====================
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return jsonify({"status": "FormSaathi AI Online"})
@@ -504,7 +446,6 @@ def ask():
         return jsonify({"error": str(e)}), 500
 
 
-# ==================== MAIN DOCUMENT ANALYZER ====================
 @app.route("/analyze-document", methods=["POST"])
 def analyze_document():
     try:
@@ -516,12 +457,12 @@ def analyze_document():
         file_bytes = file.read()
         file_size_kb = len(file_bytes) / 1024
 
-        # Preprocess Image
         pil_img = Image.open(io.BytesIO(file_bytes))
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
         original_dims = f"{pil_img.width}x{pil_img.height}"
         
-        pil_img.thumbnail((800, 800), Image.LANCZOS)
+        # Keep image dimensions at 1024 max for Llama, sharpen for readability
+        pil_img.thumbnail((1024, 1024), Image.LANCZOS)
         pil_img = pil_img.filter(ImageFilter.SHARPEN)
         pil_img = ImageEnhance.Contrast(pil_img).enhance(1.3)
         pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.8)
@@ -530,13 +471,9 @@ def analyze_document():
         pil_img.save(buf, format="JPEG", quality=75)
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        # Step 1: Extract Text via Dynamic Groq Vision Models
         extracted_text = extract_text_with_vision(img_b64) or ""
-        
-        # Step 2: Classify Document
         doc_type = classify_document(extracted_text)
         
-        # Step 3: Context-box assisted override
         if doc_type == "unknown" and user_context:
             if "aadhaar" in user_context or "आधार" in user_context:
                 doc_type = "aadhaar"
@@ -545,7 +482,6 @@ def analyze_document():
             elif "marksheet" in user_context or "10th" in user_context or "ssc" in user_context or "x " in user_context:
                 doc_type = "class_x_marksheet"
         
-        # Step 4: Extract Fields & Load Structured Information
         fields = extract_fields_from_text(extracted_text, doc_type)
         template = DOCUMENT_TEMPLATES.get(doc_type, DOCUMENT_TEMPLATES["unknown"])
         
@@ -562,8 +498,8 @@ def analyze_document():
             "where_to_submit": template["where_to_submit"],
             "portal_url": template["portal_url"],
             "important_warnings": template["important_warnings"],
-            "extracted_fields": fields if fields else {"Status": "Document recognized. Full details available in text below."},
-            "full_text": extracted_text if extracted_text else "Visual scan completed. Verification rules applied successfully."
+            "extracted_fields": fields if fields else {"Status": "Verification rules applied successfully. Details below."},
+            "full_text": extracted_text if extracted_text else "Visual scan completed."
         }
 
         return jsonify(response_data)
