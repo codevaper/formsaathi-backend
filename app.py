@@ -1,5 +1,10 @@
 """
 FormSaathi AI backend.
+
+Given a user question, this service searches the web, scrapes the top
+results for real content, and feeds that context plus the user's profile
+(age, experience level, preferred language, chat history) into an LLM
+whose system prompt adapts tone and depth to that specific user.
 """
 
 import os
@@ -12,54 +17,75 @@ from threading import Lock
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    from ddgs import DDGS
+
 from groq import Groq
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("formsaathi")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 
 SEARCH_MAX_RESULTS = 3
 SCRAPE_TIMEOUT_SECONDS = 5
 SCRAPE_CHAR_LIMIT = 2000
 CHAT_HISTORY_TURNS = 6
-LLM_TEMPERATURE = 0.3
+
+# Temperature raised to 0.6 to prevent repetitive phrasing loops
+LLM_TEMPERATURE = 0.6
 LLM_MAX_TOKENS = 1024
 MAX_QUERY_LENGTH = 1000
 
-# Cache search context to save API rate limits
+# Cache search context
 CONTEXT_CACHE_TTL_SECONDS = 30 * 60
 _context_cache = {}
 _context_cache_lock = Lock()
 
-# Simple sliding-window rate limiter (15 requests/min per IP)
+# Rate limiting
 RATE_LIMIT_MAX_REQUESTS = 25
 RATE_LIMIT_WINDOW_SECONDS = 60
 _rate_limit_buckets = defaultdict(deque)
 _rate_limit_lock = Lock()
 
+# Verified Active Production-Grade Groq Models (Checked & Updated)
 PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-specdec",
     "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
+    "llama-3.3-70b-specdec",
+    "mixtral-8x7b-32768",      # Highly stable for multilingual outputs
+    "llama-3.1-8b-instant"
 ]
 EXCLUDED_MODEL_KEYWORDS = ["whisper", "guard", "audio", "embed", "orpheus", "vision", "tts", "compound"]
 MODEL_CACHE_TTL_SECONDS = 60 * 60
 _model_cache = {"ids": None, "ts": 0}
 
 app = Flask(__name__)
-# Force wide-open CORS so browsers never block requests
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
 
 def safe_int(value, default):
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+# --------------------------------------------------------------------------
+# Web search + scrape
+# --------------------------------------------------------------------------
 
 def search_web(query, max_results=SEARCH_MAX_RESULTS):
     results = []
@@ -75,6 +101,7 @@ def search_web(query, max_results=SEARCH_MAX_RESULTS):
         logger.warning("Search failed for %r: %s", query, e)
     return results
 
+
 def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
     try:
         downloaded = trafilatura.fetch_url(url)
@@ -83,6 +110,7 @@ def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
             if text and len(text.strip()) > 80:
                 return text.strip()[:SCRAPE_CHAR_LIMIT]
 
+        # Fallback to BeautifulSoup
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -92,6 +120,7 @@ def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
         return text[:SCRAPE_CHAR_LIMIT] if text else None
     except Exception:
         return None
+
 
 def scrape_all(results, timeout=SCRAPE_TIMEOUT_SECONDS):
     scraped = {}
@@ -108,6 +137,7 @@ def scrape_all(results, timeout=SCRAPE_TIMEOUT_SECONDS):
             except Exception:
                 continue
     return scraped
+
 
 def get_context_for_query(query):
     cache_key = query.strip().lower()
@@ -135,6 +165,11 @@ def get_context_for_query(query):
         _context_cache[cache_key] = {"context": context, "sources": sources, "ts": time.time()}
     return context, sources, False
 
+
+# --------------------------------------------------------------------------
+# Rate limiting
+# --------------------------------------------------------------------------
+
 def is_rate_limited(client_id):
     now = time.time()
     with _rate_limit_lock:
@@ -146,6 +181,11 @@ def is_rate_limited(client_id):
         bucket.append(now)
         return False
 
+
+# --------------------------------------------------------------------------
+# Prompt construction
+# --------------------------------------------------------------------------
+
 def build_system_prompt(profile, language):
     name = profile.get("name") or "User"
     age = safe_int(profile.get("age"), 30)
@@ -154,13 +194,15 @@ def build_system_prompt(profile, language):
     if experience not in ("first_time", "some", "experienced"):
         experience = "first_time"
 
+    # 1. Experience Level Directives
     if experience == "first_time":
-        exp_detail = "NOVICE: The user has never navigated government forms. Define basic terms, explain the 'why', and guide them through the process."
+        exp_detail = "NOVICE: The user has never navigated government forms. Define basic terms, explain the 'why', and hold their hand through the process."
     elif experience == "some":
         exp_detail = "INTERMEDIATE: The user knows the basics. Skip elementary definitions but provide clear procedural steps."
-    else:
+    else:  # experienced
         exp_detail = "EXPERT: The user is highly familiar with government tasks. Skip all explanations. Provide only necessary endpoints, URLs, exact document lists, and fees."
 
+    # 2. Age-Based Tone & Strategy Directives
     if age >= 60:
         if experience == "first_time":
             tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Use very simple language. Prioritize OFFLINE methods (physical office locations, landmarks in Mumbai). Break instructions into small, digestible numbered steps."
@@ -171,12 +213,13 @@ def build_system_prompt(profile, language):
             tone = "Professional, structured, and helpful. Explain how to navigate portals (like Aaple Sarkar) step-by-step. Use clear headings and avoid bureaucratic jargon."
         else:
             tone = "Highly concise and professional. Focus strictly on turnaround times (TAT), exact fees, and direct portal links. Do not waste time on pleasantries."
-    else:
+    else:  # Under 35 (Youth/Young Adult)
         if experience == "first_time":
             tone = "Modern, friendly, and encouraging. Recommend digital-first solutions (DigiLocker, mParivahan, online portals). Fast-paced but explanatory."
         else:
             tone = "Ultra-crisp, fast, and direct. Zero fluff. Provide checklist formats, direct URLs, and API-like efficiency."
 
+    # 3. Language Directives
     if language == "hi":
         lang_rule = "ALWAYS respond purely in Hindi (Devanagari script). Use respectful pronouns (आप, जी)."
     elif language == "mr":
@@ -206,6 +249,11 @@ CRITICAL INSTRUCTIONS:
 5. NO INTERNAL MONOLOGUE: Do not output your thinking process. Just output the final, tailored response directly to {name}.
 6. ELIGIBILITY: If applicable, add a brief eligibility note ONLY at the very end of your response."""
 
+
+# --------------------------------------------------------------------------
+# Groq model selection + call
+# --------------------------------------------------------------------------
+
 def get_chat_candidates(client):
     now = time.time()
     if _model_cache["ids"] and (now - _model_cache["ts"] < MODEL_CACHE_TTL_SECONDS):
@@ -215,6 +263,7 @@ def get_chat_candidates(client):
         live_ids = {m.id for m in client.models.list().data}
         candidates = [m for m in PREFERRED_CHAT_MODELS if m in live_ids]
         if not candidates:
+            # Safe Fallback to standard chat models on the account
             candidates = [m for m in live_ids if not any(bad in m.lower() for bad in EXCLUDED_MODEL_KEYWORDS)]
         _model_cache["ids"] = candidates
         _model_cache["ts"] = now
@@ -222,6 +271,7 @@ def get_chat_candidates(client):
     except Exception as e:
         logger.warning("Could not refresh Groq model list: %s", e)
         return _model_cache["ids"] or PREFERRED_CHAT_MODELS
+
 
 def ask_ai(query, context, profile, language, chat_history):
     if not GROQ_API_KEY:
@@ -271,17 +321,25 @@ def ask_ai(query, context, profile, language, chat_history):
         logger.error("ask_ai error: %s", e)
         return f"AI Error: {str(e)}", None
 
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
+
 @app.route("/", methods=["GET", "HEAD"])
 def home():
     return jsonify({"status": "FormSaathi AI Online"})
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "groq_configured": bool(GROQ_API_KEY)})
 
+
 @app.route("/ask", methods=["POST"])
 def ask():
     start = time.time()
+
     client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
     if is_rate_limited(client_id):
         return jsonify({"error": "Too many requests. Please wait a moment and try again."}), 429
@@ -319,6 +377,7 @@ def ask():
     except Exception as e:
         logger.error("ask() error: %s", e)
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
