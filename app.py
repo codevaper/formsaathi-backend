@@ -1,318 +1,417 @@
-import os, io, gc, time, base64, urllib.request
+"""
+FormSaathi AI backend.
+
+Given a user question, this service searches the web, scrapes the top
+results for real content, and feeds that context plus the user's profile
+(age, experience level, preferred language, chat history) into an LLM
+whose system prompt adapts tone and depth to that specific user.
+"""
+
+import os
+import time
+import logging
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+import requests
+import trafilatura
+from bs4 import BeautifulSoup
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    # Fallback if an alternate namespace is present in some environments
+    from ddgs import DDGS
+
+from groq import Groq
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PIL import Image, ImageOps
-import numpy as np
-import cv2
-from rembg import remove, new_session
 
-# Single-thread limits to prevent CPU deadlocks on cloud hosting
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("formsaathi")
 
-# 1. Initialize Flask
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+# Comma-separated in prod once you know your frontend's domain, e.g.
+# "https://formsaathi.app,https://www.formsaathi.app". "*" is fine for now.
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
+
+SEARCH_MAX_RESULTS = 3
+SCRAPE_TIMEOUT_SECONDS = 5
+SCRAPE_CHAR_LIMIT = 2000
+CHAT_HISTORY_TURNS = 6
+LLM_TEMPERATURE = 0.3
+LLM_MAX_TOKENS = 1024
+MAX_QUERY_LENGTH = 1000
+
+# Repeat questions ("how do I apply for Aadhaar") are common for this kind
+# of assistant, so cache web search+scrape context for a while. This is
+# in-memory only -- fine for one Render instance, but won't be shared
+# across multiple worker processes/instances. Swap for Redis if you scale.
+CONTEXT_CACHE_TTL_SECONDS = 30 * 60
+_context_cache = {}
+_context_cache_lock = Lock()
+
+# Every /ask call does a web search, up to 3 scrapes, and an LLM call --
+# expensive to let anyone hammer, especially with CORS wide open. Simple
+# in-memory sliding-window limiter, no new dependency required.
+RATE_LIMIT_MAX_REQUESTS = 15
+RATE_LIMIT_WINDOW_SECONDS = 60
+_rate_limit_buckets = defaultdict(deque)
+_rate_limit_lock = Lock()
+
+# Groq's free/developer-tier catalog shifts over time -- see
+# console.groq.com/docs/models and /docs/deprecations. Groq announced on
+# 2026-06-17 that llama-3.1-8b-instant and llama-3.3-70b-versatile were
+# being deprecated for free/developer accounts in favor of the GPT-OSS
+# models below, and by late Aug 2026 both had moved to Enterprise-only
+# "Contact Sales" pricing. They're kept last here in case your account has
+# enterprise access, but don't rely on them. Reorder freely as Groq's
+# lineup changes -- get_chat_candidates() below only tries whichever of
+# these are actually live on your account.
+PREFERRED_CHAT_MODELS = [
+    "openai/gpt-oss-120b",       # best quality, still free/developer tier
+    "openai/gpt-oss-20b",        # fastest, still strong
+    "qwen/qwen3.6-27b",          # preview tier -- Groq's suggested llama-3.3 replacement
+    "llama-3.3-70b-versatile",   # Enterprise-only as of late Aug 2026 on most accounts
+    "llama-3.1-8b-instant",      # same
+]
+EXCLUDED_MODEL_KEYWORDS = ["whisper", "guard", "audio", "embed", "orpheus", "vision", "tts", "compound"]
+MODEL_CACHE_TTL_SECONDS = 60 * 60
+_model_cache = {"ids": None, "ts": 0}
+
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
-# 2. OpenCV Face Detector
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-# 3. Studio AI Model Session
-# u2netp is ultra-crisp, lightweight (4MB), and produces sharp hair/shoulder cutouts
-rembg_session = new_session("u2netp")
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
 
-# 4. Government Form Specifications
-FORM_SPECS = {
-    "aadhaar": {"name": "Aadhaar Card", "width_px": 413, "height_px": 531, "max_size_kb": 50, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
-    "driving_license": {"name": "Driving License", "width_px": 413, "height_px": 531, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
-    "income_certificate": {"name": "Income Certificate", "width_px": 160, "height_px": 212, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
-    "domicile_certificate": {"name": "Domicile Certificate", "width_px": 160, "height_px": 212, "max_size_kb": 20, "face_coverage_min": 0.70, "face_coverage_max": 0.80},
-    "voter_id": {"name": "Voter ID", "width_px": 413, "height_px": 531, "max_size_kb": 200, "face_coverage_min": 0.70, "face_coverage_max": 0.80}
-}
+def safe_int(value, default):
+    """Profile fields arrive from JSON and may be strings, missing, or
+    junk -- never let a bad `age` 500 the whole request."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-class PhotoProcessor:
-    def process(self, image_bytes, form_id):
-        t0 = time.time()
-        if form_id not in FORM_SPECS:
-            return {"success": False, "error": f"Unknown form: {form_id}"}
 
-        specs = FORM_SPECS[form_id]
-        
-        # 1. Load image and correct smartphone orientation
-        raw_pil = Image.open(io.BytesIO(image_bytes))
-        original_pil = ImageOps.exif_transpose(raw_pil).convert("RGB")
-        original_size_kb = len(image_bytes) / 1024
-        
-        # Standardize working size (keeps high resolution while maintaining speed)
-        original_pil.thumbnail((1200, 1200), Image.LANCZOS)
-        original_np = np.array(original_pil)
+# --------------------------------------------------------------------------
+# Web search + scrape
+# --------------------------------------------------------------------------
 
-        # 2. Detect face
-        face_info = self._detect_face(original_np)
-        if not face_info["face_found"]:
-            return {
-                "success": False, 
-                "error": "No clear face detected. Please upload a front-facing photo.", 
-                "original_size_kb": round(original_size_kb, 2)
-            }
-
-        original_coverage = face_info["face_height_ratio"]
-        
-        # 3. Crop face with government 75% head coverage
-        cropped_pil = self._crop_and_center_face(
-            original_pil, face_info, 
-            specs["face_coverage_min"], specs["face_coverage_max"], 
-            specs["width_px"], specs["height_px"]
-        )
-
-        # 4. Studio-Quality AI Background Removal (Original Colab Method)
-        white_bg_pil = self._replace_background_studio(cropped_pil)
-
-        # 5. Resize to exact passport dimensions with high-quality LANCZOS resampling
-        resized_pil = white_bg_pil.resize((specs["width_px"], specs["height_px"]), Image.LANCZOS)
-        
-        # 6. Compress cleanly under target KB limit
-        compressed_bytes, final_size_kb = self._compress_image(resized_pil, specs["max_size_kb"])
-
-        final_np = np.array(Image.open(io.BytesIO(compressed_bytes)))
-        final_face_info = self._detect_face(final_np)
-        final_coverage = final_face_info["face_height_ratio"] if final_face_info["face_found"] else 0.75
-
-        report = self._build_report(specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage)
-        processed_base64 = base64.b64encode(compressed_bytes).decode("utf-8")
-
-        print(f"✨ Studio processing done in {round(time.time() - t0, 2)}s", flush=True)
-
-        del original_np, final_np, raw_pil, white_bg_pil, cropped_pil, resized_pil
-        gc.collect()
-
-        return {
-            "success": True, 
-            "form": specs["name"], 
-            "processed_image_base64": processed_base64, 
-            "report": report
-        }
-
-    def _detect_face(self, image_np):
-        if face_cascade.empty():
-            h, w = image_np.shape[:2]
-            return {"face_found": True, "x": int(w*0.25), "y": int(h*0.15), "w": int(w*0.5), "h": int(h*0.5), "face_height_ratio": 0.75, "img_w": w, "img_h": h}
-        
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
-        if len(faces) == 0:
-            return {"face_found": False, "face_height_ratio": 0}
-        
-        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        img_h, img_w = image_np.shape[:2]
-        return {
-            "face_found": True, 
-            "x": int(x), "y": int(y), "w": int(w), "h": int(h), 
-            "face_height_ratio": round((h * 1.3) / img_h, 3), 
-            "img_w": img_w, "img_h": img_h
-        }
-
-    def _crop_and_center_face(self, pil_image, face_info, min_cov, max_cov, target_w, target_h):
-        img_w, img_h = face_info["img_w"], face_info["img_h"]
-        face_x, face_y, face_w, face_h = face_info["x"], face_info["y"], face_info["w"], face_info["h"]
-
-        target_coverage = (min_cov + max_cov) / 2.0
-        target_aspect = target_w / target_h
-
-        head_cx = face_x + face_w / 2.0
-        head_cy = face_y + face_h / 2.0
-        head_h = face_h * 1.3
-        
-        crop_h = head_h / target_coverage
-        crop_w = crop_h * target_aspect
-
-        crop_y1 = head_cy - (crop_h * 0.44)
-        crop_y2 = crop_y1 + crop_h
-        crop_x1 = head_cx - (crop_w / 2.0)
-        crop_x2 = crop_x1 + crop_w
-
-        pad_left = int(max(0, -crop_x1))
-        pad_top = int(max(0, -crop_y1))
-        pad_right = int(max(0, crop_x2 - img_w))
-        pad_bottom = int(max(0, crop_y2 - img_h))
-
-        if any([pad_left, pad_top, pad_right, pad_bottom]):
-            pil_image = ImageOps.expand(pil_image, (pad_left, pad_top, pad_right, pad_bottom), fill=(255, 255, 255))
-            crop_x1 += pad_left
-            crop_x2 += pad_left
-            crop_y1 += pad_top
-            crop_y2 += pad_top
-
-        return pil_image.crop((int(crop_x1), int(crop_y1), int(crop_x2), int(crop_y2)))
-
-    def _replace_background_studio(self, pil_image):
-        """Clean Neural AI Matting + Pure Solid White Matte"""
-        try:
-            img_byte_arr = io.BytesIO()
-            pil_image.save(img_byte_arr, format="PNG", compress_level=1)
-            
-            # AI Background Removal
-            removed_bg_bytes = remove(img_byte_arr.getvalue(), session=rembg_session)
-            removed_bg = Image.open(io.BytesIO(removed_bg_bytes)).convert("RGBA")
-            
-            # Solid White Canvas
-            white_bg = Image.new("RGBA", removed_bg.size, (255, 255, 255, 255))
-            white_bg.paste(removed_bg, mask=removed_bg.split()[3])
-            return white_bg.convert("RGB")
-        except Exception as e:
-            print(f"[Studio Background Error] {e}", flush=True)
-            return pil_image.convert("RGB")
-
-    def _compress_image(self, pil_image, max_size_kb):
-        quality = 95
-        while quality >= 10:
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format="JPEG", quality=quality, optimize=True)
-            size_kb = buffer.tell() / 1024
-            if size_kb <= max_size_kb:
-                return buffer.getvalue(), round(size_kb, 2)
-            quality -= 5
-            
-        buffer = io.BytesIO()
-        pil_image.save(buffer, format="JPEG", quality=10, optimize=True)
-        return buffer.getvalue(), round(buffer.tell() / 1024, 2)
-
-    def _build_report(self, specs, original_pil, original_size_kb, original_coverage, final_size_kb, final_coverage):
-        orig_w, orig_h = original_pil.size
-        return {
-            "before": {"dimensions": f"{orig_w}x{orig_h} px", "size_kb": round(original_size_kb, 2), "face_coverage": f"{round(original_coverage * 100, 1)}%", "ready": False},
-            "after": {"dimensions": f"{specs['width_px']}x{specs['height_px']} px", "size_kb": final_size_kb, "face_coverage": f"{round(final_coverage * 100, 1)}%", "max_allowed_kb": specs["max_size_kb"], "ready": final_size_kb <= specs["max_size_kb"]},
-            "checks": {
-                "face_detected": "✅ Face Detected",
-                "face_centered": "✅ Face Centered",
-                "background": "✅ Studio White Background",
-                "dimensions": f"✅ Resized to {specs['width_px']}x{specs['height_px']}px",
-                "file_size": "✅ Within Limit" if final_size_kb <= specs["max_size_kb"] else "⚠️ Slightly Over Limit"
-            }
-        }
-
-processor = PhotoProcessor()
-
-# 5. Web Search & AI Helpers
-def search_web(query, max_results=3):
-    from duckduckgo_search import DDGS
+def search_web(query, max_results=SEARCH_MAX_RESULTS):
     results = []
     try:
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
-                results.append({"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")})
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", "")
+                })
     except Exception as e:
-        print(f"[Search Error] {e}", flush=True)
+        logger.warning("Search failed for %r: %s", query, e)
     return results
 
-def scrape_url(url, timeout=5):
-    import requests, trafilatura
-    from bs4 import BeautifulSoup
+
+def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
     try:
         downloaded = trafilatura.fetch_url(url)
         if downloaded:
             text = trafilatura.extract(downloaded, include_comments=False, include_tables=True)
             if text and len(text.strip()) > 80:
-                return text.strip()[:2000]
+                return text.strip()[:SCRAPE_CHAR_LIMIT]
+
+        # Fallback to BeautifulSoup
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         text = soup.get_text(separator=" ", strip=True)
-        return text[:2000] if text else None
-    except Exception as e:
-        print(f"[Scrape Error] {e}", flush=True)
+        return text[:SCRAPE_CHAR_LIMIT] if text else None
+    except Exception:
         return None
 
-def ask_ai(query, context):
-    from groq import Groq
+
+def scrape_all(results, timeout=SCRAPE_TIMEOUT_SECONDS):
+    """Scrape every result in parallel instead of one at a time. Sequential
+    scraping of 3 sources at up to `timeout`s each could add ~15s of pure
+    waiting before the LLM is even called -- this cuts that to ~timeout."""
+    scraped = {}
+    if not results:
+        return scraped
+    with ThreadPoolExecutor(max_workers=len(results)) as executor:
+        future_to_url = {executor.submit(scrape_url, r["url"], timeout): r["url"] for r in results}
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                text = future.result()
+                if text:
+                    scraped[url] = text
+            except Exception:
+                continue
+    return scraped
+
+
+def get_context_for_query(query):
+    """Search + scrape, with a short-lived cache for repeat questions.
+    Only the raw web context is cached, never the final answer -- the
+    system prompt (and therefore the personalization) is still rebuilt
+    fresh per request from that user's own profile."""
+    cache_key = query.strip().lower()
+    with _context_cache_lock:
+        cached = _context_cache.get(cache_key)
+        if cached and (time.time() - cached["ts"] < CONTEXT_CACHE_TTL_SECONDS):
+            return cached["context"], cached["sources"], True
+
+    search_results = search_web(query)
+    all_context, sources = [], []
+    scraped_map = scrape_all(search_results)
+
+    for r in search_results:
+        text = scraped_map.get(r["url"])
+        if text:
+            all_context.append(f"[{r['title']}] ({r['url']})\n{text}")
+            sources.append({"title": r["title"], "url": r["url"]})
+
+    if not all_context:
+        all_context = [f"[{r['title']}] {r['snippet']}" for r in search_results]
+        sources = [{"title": r["title"], "url": r["url"]} for r in search_results]
+
+    context = "\n\n---\n\n".join(all_context)
+    with _context_cache_lock:
+        _context_cache[cache_key] = {"context": context, "sources": sources, "ts": time.time()}
+    return context, sources, False
+
+
+# --------------------------------------------------------------------------
+# Rate limiting
+# --------------------------------------------------------------------------
+
+def is_rate_limited(client_id):
+    now = time.time()
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets[client_id]
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+            return True
+        bucket.append(now)
+        return False
+
+
+# --------------------------------------------------------------------------
+# Prompt construction
+# --------------------------------------------------------------------------
+
+def build_system_prompt(profile, language):
+    name = profile.get("name") or "User"
+    age = safe_int(profile.get("age"), 30)
+    ward = profile.get("ward") or "Mumbai"
+    experience = profile.get("experience") or "first_time"
+    if experience not in ("first_time", "some", "experienced"):
+        # Unknown value: default to the most-explained tier, not the
+        # terse "expert" tier -- under-explaining a first-timer is worse
+        # than over-explaining an expert.
+        experience = "first_time"
+
+    # 1. Experience Level Directives
+    if experience == "first_time":
+        exp_detail = "NOVICE: The user has never navigated government forms. Define basic terms, explain the 'why', and hold their hand through the process."
+    elif experience == "some":
+        exp_detail = "INTERMEDIATE: The user knows the basics. Skip elementary definitions but provide clear procedural steps."
+    else:  # experienced
+        exp_detail = "EXPERT: The user is highly familiar with government tasks. Skip all explanations. Provide only necessary endpoints, URLs, exact document lists, and fees."
+
+    # 2. Age-Based Tone & Strategy Directives
+    if age >= 60:
+        if experience == "first_time":
+            tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Use very simple language. Prioritize OFFLINE methods (physical office locations, landmarks in Mumbai). Break instructions into small, digestible numbered steps."
+        else:
+            tone = "Respectful (Namaste) and clear. Provide both online links and offline office details in Mumbai. Keep sentences short, readable, and highly polite."
+    elif age >= 35:
+        if experience == "first_time":
+            tone = "Professional, structured, and helpful. Explain how to navigate portals (like Aaple Sarkar) step-by-step. Use clear headings and avoid bureaucratic jargon."
+        else:
+            tone = "Highly concise and professional. Focus strictly on turnaround times (TAT), exact fees, and direct portal links. Do not waste time on pleasantries."
+    else:  # Under 35 (Youth/Young Adult)
+        if experience == "first_time":
+            tone = "Modern, friendly, and encouraging. Recommend digital-first solutions (DigiLocker, mParivahan, online portals). Fast-paced but explanatory."
+        else:
+            tone = "Ultra-crisp, fast, and direct. Zero fluff. Provide checklist formats, direct URLs, and API-like efficiency."
+
+    # 3. Language Directives
+    if language == "hi":
+        lang_rule = "ALWAYS respond purely in Hindi (Devanagari script). Use respectful pronouns (आप, जी)."
+    elif language == "mr":
+        lang_rule = "ALWAYS respond purely in Marathi (Devanagari script). Use a warm, culturally respectful tone appropriate for Maharashtra."
+    elif language == "en":
+        lang_rule = "ALWAYS respond in clear Indian English."
+    else:
+        lang_rule = "AUTO-DETECT the language of the user's question and respond in the EXACT same language (Marathi for Marathi, Hindi for Hindi, etc.)."
+
+    return f"""You are FormSaathi AI, an intelligent Indian government document and scheme assistant for Mumbai, Maharashtra.
+
+USER PROFILE:
+- Name: {name}
+- Age: {age} years old
+- Location: {ward}, Mumbai, Maharashtra
+- Background: {exp_detail}
+
+COMMUNICATION STYLE TO ENFORCE:
+- Tone & Strategy: {tone}
+- Language: {lang_rule}
+
+CRITICAL INSTRUCTIONS:
+1. ADAPT TO THE USER: Strictly apply the Tone and Background rules defined above. Do not talk to a 20-year-old expert the same way you talk to a 70-year-old novice.
+2. BE DIRECT: Answer the question fully and honestly FIRST. Do not refuse to answer.
+3. LOCAL CONTEXT: Include Mumbai-specific office addresses, landmarks, and Maharashtra portals (aaplesarkar.mahaonline.gov.in, mumbaicity.gov.in) when relevant.
+4. PHOTO REQUIREMENT: If a form requires a passport photo, remind them they can use the FormSaathi Photo Resizer tab.
+5. NO INTERNAL MONOLOGUE: Do not output your thinking process. Just output the final, tailored response directly to {name}.
+6. ELIGIBILITY: If applicable, add a brief eligibility note ONLY at the very end of your response."""
+
+
+# --------------------------------------------------------------------------
+# Groq model selection + call
+# --------------------------------------------------------------------------
+
+def get_chat_candidates(client):
+    """Priority-ordered list of chat-capable model IDs to try, refreshed at
+    most once an hour instead of on every single request. Checks our
+    vetted PREFERRED_CHAT_MODELS against what's actually live on the
+    account, so a model Groq deprecates just quietly falls out of
+    rotation instead of needing a redeploy."""
+    now = time.time()
+    if _model_cache["ids"] and (now - _model_cache["ts"] < MODEL_CACHE_TTL_SECONDS):
+        return _model_cache["ids"]
+
     try:
-        if not GROQ_API_KEY:
-            return "Please configure your GROQ_API_KEY in Render."
-        
-        client = Groq(api_key=GROQ_API_KEY.strip())
-        all_models = client.models.list().data
-        chat_candidates = [
-            m.id for m in all_models 
-            if not any(bad in m.id.lower() for bad in ["whisper", "guard", "audio", "embed", "orpheus", "vision"])
-        ]
-        
+        live_ids = {m.id for m in client.models.list().data}
+        candidates = [m for m in PREFERRED_CHAT_MODELS if m in live_ids]
+        if not candidates:
+            # None of our picks are live on this account -- fall back to
+            # anything chat-shaped rather than failing outright.
+            candidates = [m for m in live_ids if not any(bad in m.lower() for bad in EXCLUDED_MODEL_KEYWORDS)]
+        _model_cache["ids"] = candidates
+        _model_cache["ts"] = now
+        return candidates
+    except Exception as e:
+        logger.warning("Could not refresh Groq model list: %s", e)
+        return _model_cache["ids"] or PREFERRED_CHAT_MODELS
+
+
+def ask_ai(query, context, profile, language, chat_history):
+    if not GROQ_API_KEY:
+        return "Please configure GROQ_API_KEY in Render.", None
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        chat_candidates = get_chat_candidates(client)
+        system_prompt = build_system_prompt(profile, language)
+
+        if not context:
+            system_prompt += (
+                "\n\nNOTE: No live web search results are available for this "
+                "answer. Answer from general knowledge, but tell the user to "
+                "verify fees, deadlines, and portal URLs on the official site "
+                "since these can change."
+            )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if chat_history:
+            for msg in chat_history[-CHAT_HISTORY_TURNS:]:
+                messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+
+        if context:
+            messages.append({"role": "user", "content": f"WEB CONTEXT:\n{context}\n\nUSER QUESTION: {query}"})
+        else:
+            messages.append({"role": "user", "content": query})
+
         for model_id in chat_candidates:
             try:
                 response = client.chat.completions.create(
                     model=model_id,
-                    messages=[
-                        {"role": "system", "content": "You are FormSaathi AI, an Indian government scheme and document assistant. Provide clear, concise answers with source citations."},
-                        {"role": "user", "content": f"WEB CONTEXT:\n{context}\n\nUSER QUESTION: {query}"}
-                    ],
-                    temperature=0.2,
-                    max_tokens=800
+                    messages=messages,
+                    temperature=LLM_TEMPERATURE,
+                    max_tokens=LLM_MAX_TOKENS,
                 )
-                return response.choices[0].message.content
-            except Exception:
+                return response.choices[0].message.content, model_id
+            except Exception as e:
+                logger.warning("Model %s failed: %s", model_id, e)
                 continue
 
         if context:
-            return f"**Information Found:**\n\n" + context[:1000] + "..."
-        return "No specific details found."
-    except Exception as e:
-        return f"AI Error: {str(e)}"
+            return f"**Live Information Found:**\n\n{context[:800]}...\n\n*(Note: AI summary is currently unavailable)*", None
+        return "No specific details found.", None
 
-# Endpoints
+    except Exception as e:
+        logger.error("ask_ai error: %s", e)
+        return f"AI Error: {str(e)}", None
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
+
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return jsonify({"status": "✅ FormSaathi Backend Online", "endpoints": ["/ask", "/process-photo", "/form-specs"]})
+    return jsonify({"status": "FormSaathi AI Online"})
+
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "groq_configured": bool(GROQ_API_KEY)})
+
 
 @app.route("/ask", methods=["POST"])
 def ask():
+    start = time.time()
+
+    client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if is_rate_limited(client_id):
+        return jsonify({"error": "Too many requests. Please wait a moment and try again."}), 429
+
     try:
-        data = request.get_json(force=True)
-        query = data.get("query", "").strip()
+        data = request.get_json(silent=True)
+        if data is None:
+            return jsonify({"error": "Request body must be valid JSON"}), 400
+
+        query = (data.get("query") or "").strip()
+        mode = data.get("mode") or "standard"
+        language = data.get("language") or "auto"
+        profile = data.get("profile") or {}
+        chat_history = data.get("chat_history") or []
+
         if not query:
-            return jsonify({"error": "Missing query parameter"}), 400
-        
-        search_results = search_web(query, max_results=3)
-        all_context, sources = [], []
-        for r in search_results:
-            text = scrape_url(r["url"])
-            if text:
-                all_context.append(f"[{r['title']}] ({r['url']})\n{text}")
-                sources.append({"title": r["title"], "url": r["url"]})
-        
-        if not all_context:
-            all_context = [f"[{r['title']}] {r['snippet']}" for r in search_results]
-            sources = [{"title": r["title"], "url": r["url"]} for r in search_results]
+            return jsonify({"error": "Missing query"}), 400
+        if len(query) > MAX_QUERY_LENGTH:
+            return jsonify({"error": f"Query too long (max {MAX_QUERY_LENGTH} characters)"}), 400
 
-        answer = ask_ai(query, "\n\n---\n\n".join(all_context))
+        if mode == "quick":
+            context, sources, from_cache = "", [], False
+        else:
+            context, sources, from_cache = get_context_for_query(query)
+
+        answer, model_used = ask_ai(query, context, profile, language, chat_history)
+
+        logger.info(
+            "query=%r mode=%s model=%s cache=%s took=%.2fs",
+            query, mode, model_used, from_cache, time.time() - start
+        )
+
         return jsonify({"success": True, "answer": answer, "sources": sources})
+
     except Exception as e:
+        logger.error("ask() error: %s", e)
         return jsonify({"error": str(e)}), 500
 
-@app.route("/process-photo", methods=["POST"])
-def process_photo():
-    try:
-        if "photo" not in request.files or "form_id" not in request.form:
-            return jsonify({"error": "Missing 'photo' or 'form_id'"}), 400
-        photo = request.files["photo"]
-        form_id = request.form["form_id"]
-        result = processor.process(photo.read(), form_id)
-        return jsonify(result)
-    except Exception as e:
-        print(f"Process photo error: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/form-specs", methods=["GET"])
-def form_specs():
-    return jsonify({"success": True, "forms": FORM_SPECS})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
