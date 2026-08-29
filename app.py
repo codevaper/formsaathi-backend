@@ -228,24 +228,29 @@ def build_system_prompt(profile, language):
         exp_detail = "INTERMEDIATE: The user knows the basics. Skip elementary definitions but provide clear procedural steps."
     else:  # experienced
         exp_detail = "EXPERT: The user is highly familiar with government tasks. Skip all explanations. Provide only necessary endpoints, URLs, exact document lists, and fees."
-
-    # 2. Age-Based Tone & Strategy Directives
+# 2. Age-Based Tone & Formatting Directives
     if age >= 60:
         if experience == "first_time":
-            tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Use very simple language. Prioritize OFFLINE methods (physical office locations, landmarks in Mumbai). Break instructions into small, digestible numbered steps."
+            tone = "Extremely warm, patient, and respectful (Namaste/Pranam). Speak as if guiding a grandparent. Prioritize OFFLINE methods (physical offices in Mumbai). Limit to 3 very simple steps."
         else:
-            tone = "Respectful (Namaste) and clear. Provide both online links and offline office details in Mumbai. Keep sentences short, readable, and highly polite."
+            tone = "Warm, respectful, and clear (Namaste). Provide both online and offline options, but keep them completely separate and easy to read."
+        
+        # CRITICAL FIX FOR SENIORS: Ban tables and force whitespace
+        format_rule = "STRICT FORMATTING FOR SENIORS: NEVER use markdown tables. NEVER use complex jargon like 'URL', 'PDF', or 'Portal'. Use very short sentences. Use simple bullet points. MUST leave a blank line between every single bullet point so it is easy to read."
+    
     elif age >= 35:
         if experience == "first_time":
-            tone = "Professional, structured, and helpful. Explain how to navigate portals (like Aaple Sarkar) step-by-step. Use clear headings and avoid bureaucratic jargon."
+            tone = "Professional, structured, and helpful. Explain how to navigate portals step-by-step."
         else:
-            tone = "Highly concise and professional. Focus strictly on turnaround times (TAT), exact fees, and direct portal links. Do not waste time on pleasantries."
-    else:  # Under 35 (Youth/Young Adult)
+            tone = "Highly concise and professional. Focus strictly on turnaround times, exact fees, and direct links."
+        format_rule = "FORMATTING: Use clear headings, bullet points, and tables if comparing data."
+    
+    else: # Under 35
         if experience == "first_time":
-            tone = "Modern, friendly, and encouraging. Recommend digital-first solutions (DigiLocker, mParivahan, online portals). Fast-paced but explanatory."
+            tone = "Modern, friendly, and encouraging. Recommend digital-first solutions (DigiLocker, etc)."
         else:
-            tone = "Ultra-crisp, fast, and direct. Zero fluff. Provide checklist formats, direct URLs, and API-like efficiency."
-
+            tone = "Ultra-crisp, fast, and direct. Zero fluff."
+        format_rule = "FORMATTING: Use modern markdown, code-block style checklists, and direct URLs."
     # 3. Language Directives
     if language == "hi":
         lang_rule = "ALWAYS respond purely in Hindi (Devanagari script). Use respectful pronouns (आप, जी)."
