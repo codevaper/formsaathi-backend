@@ -57,19 +57,12 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # SMART MODEL FALLBACK ENGINE (AUTO-ADAPTS TO GROQ CHANGES)
 # ======================================================================
 def call_groq_with_fallback(client, preferred_models, **kwargs):
-    """Dynamically checks which models are actually available on your free tier"""
     try:
-        # Ask Groq what models are currently live for THIS api key
         live_models_data = client.models.list().data
         live_ids = {m.id for m in live_models_data}
-        
-        # Filter our preferred list to only those that are live
         available_models = [m for m in preferred_models if m in live_ids]
-        
-        # If Groq deprecated everything on our list, just grab the first text model available!
         if not available_models:
             available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
-            
     except Exception as e:
         logger.warning(f"Could not fetch live models: {e}")
         available_models = preferred_models
@@ -83,8 +76,6 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
             logger.warning(f"Model {model_name} failed. Attempting next... Error: {e}")
             last_error = e
             continue
-            
-    # If all fail, throw the last error so the frontend sees it
     raise last_error
 
 # ======================================================================
@@ -127,7 +118,7 @@ def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
             text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
             if text and len(text.strip()) > 80: return text.strip()[:1500]
         
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]): tag.decompose()
@@ -158,14 +149,21 @@ def build_system_prompt(profile, language):
     name = profile.get("name") or "User"
     age = safe_int(profile.get("age"), 30)
     ward = profile.get("ward") or "Mumbai"
+    # Added "experienced" mapping from the other AI's observation
+    experience = profile.get("experience") or "first_time"
 
     lang_rule = "Respond ONLY in Hindi (Devanagari). Use आप and जी." if language == "hi" else \
                 "Respond ONLY in Marathi (Devanagari)." if language == "mr" else \
                 "Respond ONLY in Indian English." if language == "en" else "Detect user language."
 
-    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning. Answer immediately.\n3. Be helpful."
-    if age >= 60: return base + "\n4. Keep it simple. Max 3-4 steps. Mention physical offices."
-    else: return base + "\n4. Be concise, digital-first, include links."
+    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning. Answer immediately.\n3. Formatting: Use Markdown (## Headers, **Bold**, Lists) nicely."
+    
+    if experience in ("expert", "experienced") and age < 60:
+        return base + "\n4. User is highly experienced. Be ultra-crisp, provide exact portal links, and TAT. Skip hand-holding."
+    elif age >= 60: 
+        return base + "\n4. Keep it simple. Max 3-4 steps. Mention physical offices."
+    else: 
+        return base + "\n4. Be concise, digital-first, include links."
 
 # ======================================================================
 # API ENDPOINTS
@@ -198,7 +196,6 @@ def ask():
 
         client = Groq(api_key=GROQ_API_KEY_CHAT)
         
-        # 🔥 Using the Auto-Adapting Fallback Engine
         response = call_groq_with_fallback(
             client=client,
             preferred_models=PREFERRED_CHAT_MODELS,
@@ -213,7 +210,6 @@ def ask():
     except Exception as e:
         logger.error(f"Chat error: {e}")
         return jsonify({"error": f"Groq AI Error: {str(e)}"}), 500
-
 
 @app.route("/summarize-doc", methods=["POST", "OPTIONS"])
 def summarize_doc():
@@ -236,8 +232,6 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
 }}"""
 
         client = Groq(api_key=GROQ_API_KEY_CHAT)
-        
-        # 🔥 Using the Auto-Adapting Fallback Engine
         response = call_groq_with_fallback(
             client=client,
             preferred_models=PREFERRED_CHAT_MODELS,
@@ -266,42 +260,6 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
     except Exception as e:
         logger.error(f"Summarize error: {e}")
         return jsonify({"error": f"Groq API Error: {str(e)}"}), 500
-
-
-@app.route("/optimize-document", methods=["POST", "OPTIONS"])
-def optimize_document():
-    if request.method == "OPTIONS": return "", 204
-    try:
-        file = request.files["document"]
-        target_kb = int(request.form.get("target_kb", 200))
-        
-        pil_img = Image.open(io.BytesIO(file.read()))
-        pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
-        
-        if pil_img.width > 1200:
-            pil_img = pil_img.resize((1200, int(pil_img.height * (1200/pil_img.width))), Image.LANCZOS)
-        
-        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.2)
-        pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.3)
-        
-        q = 95
-        buf = io.BytesIO()
-        while q >= 10:
-            buf = io.BytesIO()
-            pil_img.save(buf, format="JPEG", quality=q, optimize=True)
-            if (buf.tell() / 1024) <= target_kb: break
-            q -= 5
-            
-        return jsonify({
-            "success": True,
-            "optimized_size_kb": round(buf.tell() / 1024, 2),
-            "dimensions": f"{pil_img.width}x{pil_img.height}",
-            "optimized_image_base64": base64.b64encode(buf.getvalue()).decode("utf-8"),
-            "within_limit": (buf.tell() / 1024) <= target_kb
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
