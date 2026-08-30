@@ -1,5 +1,5 @@
 """
-FormSaathi AI Unified Backend — Model-Cascade Production Build
+FormSaathi AI Unified Backend — Auto-Adapting Production Build
 """
 
 import os, io, time, base64, logging, re, json
@@ -42,27 +42,40 @@ _rate_limit_lock = Lock()
 RATE_LIMIT_MAX_REQUESTS = 25
 RATE_LIMIT_WINDOW_SECONDS = 60
 
-# Model Cascades: If [0] fails, it automatically tries [1], then [2]
+# Updated to Groq's new free tier & open-source models
 PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile", 
-    "llama-3.1-8b-instant", 
-    "llama3-8b-8192"
-]
-VISION_MODELS = [
-    "llama-3.2-11b-vision-preview", 
-    "llama-3.2-90b-vision-preview"
+    "openai/gpt-oss-120b", 
+    "openai/gpt-oss-20b", 
+    "qwen/qwen3.6-27b",
+    "llama-3.3-70b-versatile"
 ]
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ======================================================================
-# SMART MODEL FALLBACK ENGINE
+# SMART MODEL FALLBACK ENGINE (AUTO-ADAPTS TO GROQ CHANGES)
 # ======================================================================
-def call_groq_with_fallback(client, models_list, **kwargs):
-    """Tries models sequentially. If one is down or rate-limited, tries the next."""
+def call_groq_with_fallback(client, preferred_models, **kwargs):
+    """Dynamically checks which models are actually available on your free tier"""
+    try:
+        # Ask Groq what models are currently live for THIS api key
+        live_models_data = client.models.list().data
+        live_ids = {m.id for m in live_models_data}
+        
+        # Filter our preferred list to only those that are live
+        available_models = [m for m in preferred_models if m in live_ids]
+        
+        # If Groq deprecated everything on our list, just grab the first text model available!
+        if not available_models:
+            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
+            
+    except Exception as e:
+        logger.warning(f"Could not fetch live models: {e}")
+        available_models = preferred_models
+
     last_error = None
-    for model_name in models_list:
+    for model_name in available_models:
         try:
             kwargs['model'] = model_name
             return client.chat.completions.create(**kwargs)
@@ -70,7 +83,8 @@ def call_groq_with_fallback(client, models_list, **kwargs):
             logger.warning(f"Model {model_name} failed. Attempting next... Error: {e}")
             last_error = e
             continue
-    # If we exhaust the list and all fail, throw the last error
+            
+    # If all fail, throw the last error so the frontend sees it
     raise last_error
 
 # ======================================================================
@@ -184,10 +198,10 @@ def ask():
 
         client = Groq(api_key=GROQ_API_KEY_CHAT)
         
-        # 🔥 Using the new Fallback Engine
+        # 🔥 Using the Auto-Adapting Fallback Engine
         response = call_groq_with_fallback(
             client=client,
-            models_list=PREFERRED_CHAT_MODELS,
+            preferred_models=PREFERRED_CHAT_MODELS,
             messages=messages,
             temperature=LLM_TEMPERATURE,
             max_tokens=LLM_MAX_TOKENS
@@ -223,10 +237,10 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
 
         client = Groq(api_key=GROQ_API_KEY_CHAT)
         
-        # 🔥 Using the new Fallback Engine
+        # 🔥 Using the Auto-Adapting Fallback Engine
         response = call_groq_with_fallback(
             client=client,
-            models_list=PREFERRED_CHAT_MODELS,
+            preferred_models=PREFERRED_CHAT_MODELS,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=300
@@ -254,63 +268,39 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
         return jsonify({"error": f"Groq API Error: {str(e)}"}), 500
 
 
-@app.route("/analyze-document", methods=["POST", "OPTIONS"])
-def analyze_document():
-    # Only used if you bypass OCR and send raw images to backend
+@app.route("/optimize-document", methods=["POST", "OPTIONS"])
+def optimize_document():
     if request.method == "OPTIONS": return "", 204
     try:
-        if "document" not in request.files: return jsonify({"error": "No document"}), 400
+        file = request.files["document"]
+        target_kb = int(request.form.get("target_kb", 200))
         
-        file_bytes = request.files["document"].read()
-        pil_img = Image.open(io.BytesIO(file_bytes))
+        pil_img = Image.open(io.BytesIO(file.read()))
         pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
-        pil_img.thumbnail((1024, 1024), Image.LANCZOS)
         
+        if pil_img.width > 1200:
+            pil_img = pil_img.resize((1200, int(pil_img.height * (1200/pil_img.width))), Image.LANCZOS)
+        
+        pil_img = ImageEnhance.Contrast(pil_img).enhance(1.2)
+        pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.3)
+        
+        q = 95
         buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=75)
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        prompt = """Extract the details from this document. Output ONLY a raw JSON object. Do not use markdown. Do not add explanations.
-{
-  "document_type": "Aadhaar Card/PAN Card/Voter ID/Certificate/Other",
-  "quality": "Good/Fair/Poor",
-  "extracted_fields": {"Name": "value", "DOB": "value", "ID Number": "value", "Address": "value"},
-  "full_text": "all readable text",
-  "what_is_this_document": "short description"
-}"""
-        
-        client = Groq(api_key=GROQ_API_KEY_VISION)
-        
-        # 🔥 Using the new Fallback Engine for Vision
-        response = call_groq_with_fallback(
-            client=client,
-            models_list=VISION_MODELS,
-            messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]}],
-            temperature=0.1, max_tokens=1000
-        )
-        
-        raw_text = strip_think_tags(response.choices[0].message.content.strip())
-        data = {}
-        try:
-            clean = re.sub(r"^```(?:json)?\n?", "", raw_text)
-            clean = re.sub(r"\n?```$", "", clean)
-            json_match = re.search(r'\{.*\}', clean, re.DOTALL)
-            if json_match: data = json.loads(json_match.group())
-        except Exception:
-            data = {"document_type": "Document", "quality": "Fair", "full_text": raw_text[:500]}
+        while q >= 10:
+            buf = io.BytesIO()
+            pil_img.save(buf, format="JPEG", quality=q, optimize=True)
+            if (buf.tell() / 1024) <= target_kb: break
+            q -= 5
             
         return jsonify({
-            "success": True, 
-            "document_type": data.get("document_type", "Scanned Document"),
-            "quality": data.get("quality", "Fair"),
-            "extracted_fields": data.get("extracted_fields", {}),
-            "ocr_text": data.get("full_text", raw_text[:500]),
-            "file_size_kb": round(len(file_bytes) / 1024, 2),
-            "dimensions": f"{pil_img.width}x{pil_img.height}"
+            "success": True,
+            "optimized_size_kb": round(buf.tell() / 1024, 2),
+            "dimensions": f"{pil_img.width}x{pil_img.height}",
+            "optimized_image_base64": base64.b64encode(buf.getvalue()).decode("utf-8"),
+            "within_limit": (buf.tell() / 1024) <= target_kb
         })
     except Exception as e:
-        logger.error(f"Doc error: {e}")
-        return jsonify({"error": f"Vision API Error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
