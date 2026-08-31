@@ -35,16 +35,15 @@ CHAT_HISTORY_TURNS = 4
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 4000
 
-# Models
+# STANDARD TEXT MODELS (For Chat & Summarization)
 PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "mixtral-8x7b-32768"
 ]
 
+# STRICT VISION MODELS ONLY (No text-only models, no preview models)
 VISION_MODELS = [
-    "llama-3.2-90b-vision-preview",
-    "llama-3.2-11b-vision-preview",
     "llama-3.2-90b-vision-instruct",
     "llama-3.2-11b-vision-instruct"
 ]
@@ -60,18 +59,13 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ======================================================================
-# THINK-TAG STRIPPER (Bulletproof - no angle brackets in literals)
+# DATA CLEANING UTILS
 # ======================================================================
-_THINK_OPEN = chr(60) + "think" + chr(62)
-_THINK_CLOSE = chr(60) + "/think" + chr(62)
-_THINK_PATTERN = _THINK_OPEN + ".*?" + _THINK_CLOSE
-_THINK_TAG = chr(60) + "/?" + "think" + chr(62)
-
 def strip_think_tags(text):
     if not text:
         return text
-    text = re.sub(_THINK_PATTERN, "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(_THINK_TAG, "", text, flags=re.IGNORECASE)
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'</?think>', '', text, flags=re.IGNORECASE)
     return text.strip()
 
 def strip_code_fences(text):
@@ -87,7 +81,7 @@ def extract_json_object(text):
     return json.loads(text[start_idx:end_idx + 1])
 
 # ======================================================================
-# SMART MODEL FALLBACK ENGINE
+# SMART MODEL FALLBACK ENGINE (TEXT)
 # ======================================================================
 def call_groq_with_fallback(client, preferred_models, **kwargs):
     try:
@@ -97,7 +91,7 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
         if not available_models:
             available_models = [
                 m.id for m in live_models_data
-                if "whisper" not in m.id and "tts" not in m.id
+                if "whisper" not in m.id and "tts" not in m.id and "vision" not in m.id
             ]
     except Exception as e:
         logger.warning("Could not fetch live models: %s", e)
@@ -115,7 +109,7 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
     raise last_error
 
 # ======================================================================
-# UTILS
+# SEARCH UTILS
 # ======================================================================
 def safe_int(value, default):
     try:
@@ -204,7 +198,7 @@ def build_system_prompt(profile, language):
         "1. {}\n"
         "2. DO NOT output any thinking or reasoning tags.\n"
         "3. Use Markdown formatting.\n"
-        "4. REDACT AADHAAR NUMBERS AS XXXX XXXX XXXX ALWAYS."
+        "4. REDACT AADHAAR NUMBERS AS [Aadhaar Redacted] ALWAYS."
     ).format(name, ward, lang_rule)
 
     if experience in ("expert", "experienced") and age < 60:
@@ -371,7 +365,7 @@ def analyze_document():
             "}}"
         ).format(persona, task)
 
-        # PROPER MULTIMODAL STRUCTURE - image in user message only
+        # STRICT MULTIMODAL STRUCTURE - image purely in the user message payload
         messages = [
             {
                 "role": "user",
@@ -387,7 +381,7 @@ def analyze_document():
             }
         ]
 
-        # Try each vision model until one works
+        # Loop ONLY through guaranteed Vision models
         last_error = None
         raw_response = None
 
@@ -411,6 +405,7 @@ def analyze_document():
             logger.error("All vision models failed. Last error: %s", last_error)
             return jsonify({"error": "Vision analysis failed: {}".format(str(last_error))}), 500
 
+        # Bulletproof cleanup sequence
         raw_response = strip_think_tags(raw_response)
         raw_response = strip_code_fences(raw_response)
 
