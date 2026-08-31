@@ -291,7 +291,7 @@ def analyze_document():
         """
         
         response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct", # Groq's current active vision model
+            model="qwen/qwen3.6-27b", # Guaranteed active, free Groq Multimodal Vision Model
             messages=[
                 {
                     "role": "user",
