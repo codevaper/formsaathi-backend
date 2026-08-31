@@ -10,7 +10,6 @@ from threading import Lock
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
-from PIL import Image, ImageOps, ImageEnhance
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -149,7 +148,6 @@ def build_system_prompt(profile, language):
     name = profile.get("name") or "User"
     age = safe_int(profile.get("age"), 30)
     ward = profile.get("ward") or "Mumbai"
-    # Added "experienced" mapping from the other AI's observation
     experience = profile.get("experience") or "first_time"
 
     lang_rule = "Respond ONLY in Hindi (Devanagari). Use आप and जी." if language == "hi" else \
@@ -260,6 +258,81 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
     except Exception as e:
         logger.error(f"Summarize error: {e}")
         return jsonify({"error": f"Groq API Error: {str(e)}"}), 500
+
+@app.route("/analyze-document", methods=["POST", "OPTIONS"])
+def analyze_document():
+    if request.method == "OPTIONS": return "", 204
+    try:
+        if "document" not in request.files:
+            return jsonify({"error": "No document uploaded"}), 400
+            
+        file = request.files["document"]
+        context = request.form.get("context", "Analyze this document.")
+        
+        # Read the file and convert it to Base64 so Groq Vision can see it
+        image_bytes = file.read()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        mime_type = file.content_type or "image/jpeg"
+        
+        # Must use a specific Vision model for images
+        client = Groq(api_key=GROQ_API_KEY_VISION)
+        
+        prompt = f"""You are an expert AI assistant helping Indian citizens with paperwork.
+        Look at this document image. 
+        User's context/question: {context}
+        
+        Output ONLY a JSON object with these exact keys. Do NOT wrap in markdown blocks like ```json.
+        {{
+          "document_type": "Name of document (e.g. PAN, Voter ID, Utility Bill, Unknown)",
+          "quality": "Legibility (e.g. Clear, Blurry, Cropped)",
+          "extracted_fields": {{"Name": "Value", "Date": "Value"}},
+          "ocr_text": "A brief 2-3 sentence summary of the visible text/content."
+        }}
+        """
+        
+        response = client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview", # Groq's fast free vision model
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.1,
+            max_tokens=800
+        )
+        
+        raw_response = response.choices[0].message.content.strip()
+        
+        # Clean and parse the JSON string from the AI
+        clean = re.sub(r"^```(?:json)?\n?", "", raw_response)
+        clean = re.sub(r"\n?```$", "", clean)
+        json_match = re.search(r'\{.*\}', clean, re.DOTALL)
+        
+        if json_match:
+            result_data = json.loads(json_match.group())
+        else:
+            result_data = {
+                "document_type": "Document",
+                "quality": "Unknown",
+                "extracted_fields": {},
+                "ocr_text": raw_response[:200]
+            }
+            
+        return jsonify(result_data)
+        
+    except Exception as e:
+        logger.error(f"Vision error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
