@@ -290,8 +290,8 @@ def analyze_document():
         }}
         """
         
-        response = client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview", # Groq's fast free vision model
+       response = client.chat.completions.create(
+            model="llama-3.2-90b-vision-preview", # Updated active Groq vision model
             messages=[
                 {
                     "role": "user",
