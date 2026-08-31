@@ -42,10 +42,10 @@ PREFERRED_CHAT_MODELS = [
     "mixtral-8x7b-32768"
 ]
 
-# STRICT VISION MODELS ONLY (No text-only models, no preview models)
+# ACTIVE MULTIMODAL VISION MODELS ON GROQ
 VISION_MODELS = [
-    "llama-3.2-90b-vision-instruct",
-    "llama-3.2-11b-vision-instruct"
+    "qwen/qwen3.6-27b",
+    "qwen/qwen3.8-27b"
 ]
 
 GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
@@ -365,7 +365,6 @@ def analyze_document():
             "}}"
         ).format(persona, task)
 
-        # STRICT MULTIMODAL STRUCTURE - image purely in the user message payload
         messages = [
             {
                 "role": "user",
@@ -381,7 +380,6 @@ def analyze_document():
             }
         ]
 
-        # Loop ONLY through guaranteed Vision models
         last_error = None
         raw_response = None
 
@@ -405,7 +403,6 @@ def analyze_document():
             logger.error("All vision models failed. Last error: %s", last_error)
             return jsonify({"error": "Vision analysis failed: {}".format(str(last_error))}), 500
 
-        # Bulletproof cleanup sequence
         raw_response = strip_think_tags(raw_response)
         raw_response = strip_code_fences(raw_response)
 
