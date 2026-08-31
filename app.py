@@ -290,8 +290,8 @@ def analyze_document():
         }}
         """
         
-       response = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview", # Updated active Groq vision model
+        response = client.chat.completions.create(
+            model="llama-3.2-90b-vision-preview", # Updated to the active Groq 90b vision model
             messages=[
                 {
                     "role": "user",
@@ -332,7 +332,6 @@ def analyze_document():
     except Exception as e:
         logger.error(f"Vision error: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
