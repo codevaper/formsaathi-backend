@@ -86,6 +86,7 @@ def safe_int(value, default):
 
 def strip_think_tags(text):
     if not text: return text
+    # This deletes everything between <think> and </think>
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<think>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
     return text.strip()
@@ -239,8 +240,8 @@ Output ONLY a JSON object with this exact structure.
         )
 
         raw_response = response.choices[0].message.content.strip()
+        raw_response = strip_think_tags(raw_response)
         
-        # BULLETPROOF JSON PARSING
         try:
             start_idx = raw_response.find('{')
             end_idx = raw_response.rfind('}')
@@ -279,16 +280,17 @@ def analyze_document():
         
         client = Groq(api_key=GROQ_API_KEY_VISION)
         
+        # MASSIVELY IMPROVED PROMPT FOR BETTER, DETAILED ANSWERS
         prompt = f"""You are an expert AI assistant helping Indian citizens with paperwork.
-        Look at this document image. 
-        User's context/question: {context}
+        Look at this document image carefully. 
+        User's prompt: "{context}"
         
-        Output ONLY a JSON object with these exact keys.
+        Output ONLY a JSON object with these exact keys. Do NOT use markdown code blocks.
         {{
-          "document_type": "Name of document (e.g. PAN, Voter ID, Utility Bill, Unknown)",
-          "quality": "Legibility (e.g. Clear, Blurry, Cropped)",
-          "extracted_fields": {{"Name": "Value"}},
-          "ocr_text": "A brief 2-3 sentence summary of the visible text/content."
+          "document_type": "Name of document (e.g. PAN, Voter ID, Utility Bill)",
+          "quality": "Legibility (e.g. Clear, Blurry)",
+          "extracted_fields": {{"Key Detail": "Value"}},
+          "ocr_text": "Write a highly detailed, comprehensive paragraph here. First, list all the important text and information you see. Second, directly answer the user's prompt thoroughly. If the user did not ask a specific question, explain what this document is generally used for and what their next steps might be."
         }}
         """
         
@@ -309,12 +311,14 @@ def analyze_document():
                 }
             ],
             temperature=0.1,
-            max_tokens=800
+            max_tokens=1500
         )
         
         raw_response = response.choices[0].message.content.strip()
         
-        # BULLETPROOF JSON PARSING
+        # CRITICAL FIX: Erase the <think> tags entirely before python touches it
+        raw_response = strip_think_tags(raw_response)
+        
         try:
             start_idx = raw_response.find('{')
             end_idx = raw_response.rfind('}')
@@ -325,11 +329,12 @@ def analyze_document():
                 raise ValueError("No braces found in AI response")
         except Exception as e:
             logger.error(f"Vision JSON Parse Error: {e}")
+            # INFINITE FALLBACK: If JSON breaks, give the user the ENTIRE detailed answer anyway!
             result_data = {
-                "document_type": "Document",
-                "quality": "Unknown",
+                "document_type": "Analyzed Document",
+                "quality": "Processed",
                 "extracted_fields": {},
-                "ocr_text": raw_response[:300] # Pass whatever the AI said directly to the user
+                "ocr_text": raw_response 
             }
             
         return jsonify(result_data)
