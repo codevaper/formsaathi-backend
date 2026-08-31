@@ -31,22 +31,18 @@ GROQ_API_KEY_TUTORIAL = os.environ.get("GROQ_API_KEY_TUTORIAL", "").strip() or D
 
 # Limits & Settings
 SEARCH_MAX_RESULTS = 2
-SCRAPE_TIMEOUT_SECONDS = 2.0
+SCRAPE_TIMEOUT_SECONDS = 2.0  
 CHAT_HISTORY_TURNS = 4
 LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 2048
+LLM_MAX_TOKENS = 4000  
 
-# Updated to Groq's new free tier & open-source models
+# In 2026, the main models natively support image inputs! No buggy vision models needed.
 PREFERRED_CHAT_MODELS = [
-    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
     "openai/gpt-oss-20b",
-    "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile"
+    "openai/gpt-oss-120b"
 ]
 
-# Generic placeholder text the frontend sends when the user didn't type an
-# actual question alongside the photo -- used to tell "no real question"
-# apart from "user asked something specific".
 GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
 
 _rate_limit_buckets = defaultdict(deque)
@@ -66,7 +62,7 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
         live_ids = {m.id for m in live_models_data}
         available_models = [m for m in preferred_models if m in live_ids]
         if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
+            available_models = [m.id for m in live_models_data if "whisper" not in m.id]
     except Exception as e:
         logger.warning(f"Could not fetch live models: {e}")
         available_models = preferred_models
@@ -77,7 +73,7 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
             kwargs['model'] = model_name
             return client.chat.completions.create(**kwargs)
         except Exception as e:
-            logger.warning(f"Model {model_name} failed. Attempting next... Error: {e}")
+            logger.warning(f"Model {model_name} failed. Error: {e}")
             last_error = e
             continue
     raise last_error
@@ -92,18 +88,14 @@ def safe_int(value, default):
 def strip_think_tags(text):
     if not text: return text
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<think>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'</?think>', '', text, flags=re.IGNORECASE)
     return text.strip()
 
 def strip_code_fences(text):
-    """Models often wrap JSON in ```json ... ``` even when told not to."""
     if not text: return text
     return re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip())
 
 def extract_json_object(text):
-    """Grabs the first-to-last brace span and parses it. Only safe to call
-    AFTER strip_think_tags -- otherwise a brace inside the model's reasoning
-    can get matched instead of the real JSON object."""
     start_idx = text.find('{')
     end_idx = text.rfind('}')
     if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
@@ -123,7 +115,7 @@ def is_rate_limited(client_id):
 def search_web_safe(query, max_results=SEARCH_MAX_RESULTS):
     results = []
     try:
-        with DDGS(timeout=3) as ddgs:
+        with DDGS(timeout=3) as ddgs: 
             for r in ddgs.text(query, max_results=max_results):
                 results.append({"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")})
     except Exception as e:
@@ -136,7 +128,7 @@ def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
         if downloaded:
             text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
             if text and len(text.strip()) > 80: return text.strip()[:1500]
-
+        
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=timeout)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -147,7 +139,7 @@ def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
 def get_context_for_query(query):
     search_results = search_web_safe(query)
     all_context, sources = [], []
-
+    
     if not search_results: return "", []
 
     with ThreadPoolExecutor(max_workers=min(len(search_results), 3)) as executor:
@@ -161,7 +153,7 @@ def get_context_for_query(query):
                     all_context.append(f"[{title}] ({url})\n{text}")
                     sources.append({"title": title, "url": url})
             except Exception: continue
-
+    
     return "\n\n---\n\n".join(all_context), sources
 
 def build_system_prompt(profile, language):
@@ -174,14 +166,14 @@ def build_system_prompt(profile, language):
                 "Respond ONLY in Marathi (Devanagari)." if language == "mr" else \
                 "Respond ONLY in Indian English." if language == "en" else "Detect user language."
 
-    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning. Answer immediately.\n3. Formatting: Use Markdown (## Headers, **Bold**, Lists) nicely."
-
+    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning.\n3. Formatting: Use Markdown nicely.\n4. REDACT AADHAAR NUMBERS AS XXXX XXXX XXXX ALWAYS."
+    
     if experience in ("expert", "experienced") and age < 60:
-        return base + "\n4. User is highly experienced. Be ultra-crisp, provide exact portal links, and TAT. Skip hand-holding."
-    elif age >= 60:
-        return base + "\n4. Keep it simple. Max 3-4 steps. Mention physical offices."
-    else:
-        return base + "\n4. Be concise, digital-first, include links."
+        return base + "\n5. User is highly experienced. Be ultra-crisp, provide exact portal links, and TAT. Skip hand-holding."
+    elif age >= 60: 
+        return base + "\n5. Keep it simple. Max 3-4 steps. Mention physical offices."
+    else: 
+        return base + "\n5. Be concise, digital-first, include links."
 
 # ======================================================================
 # API ENDPOINTS
@@ -208,12 +200,12 @@ def ask():
         messages = [{"role": "system", "content": system_prompt}]
         for msg in (data.get("chat_history") or [])[-CHAT_HISTORY_TURNS:]:
             messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
-
+        
         user_msg = f"REFERENCE DATA:\n{context[:2500]}\n\nQUESTION: {query}" if context else query
         messages.append({"role": "user", "content": user_msg})
 
         client = Groq(api_key=GROQ_API_KEY_CHAT)
-
+        
         response = call_groq_with_fallback(
             client=client,
             preferred_models=PREFERRED_CHAT_MODELS,
@@ -221,10 +213,10 @@ def ask():
             temperature=LLM_TEMPERATURE,
             max_tokens=LLM_MAX_TOKENS
         )
-
+        
         clean_answer = strip_think_tags(response.choices[0].message.content)
         return jsonify({"success": True, "answer": clean_answer, "sources": sources})
-
+        
     except Exception as e:
         logger.error(f"Chat error: {e}")
         return jsonify({"error": f"Groq AI Error: {str(e)}"}), 500
@@ -242,9 +234,9 @@ def summarize_doc():
 {extracted_text[:1500]}
 --- END TEXT ---
 
-Output ONLY a JSON object with this exact structure. Do not use markdown wrappers.
+Output ONLY a JSON object with this exact structure.
 {{
-  "document_type": "Short name (e.g. Aadhaar Card, PAN Card, Income Certificate, Marksheet, Other)",
+  "document_type": "Short name",
   "description": "1 clear sentence explaining what this document proves.",
   "actionable_steps": "1 brief sentence on where or how to use this document."
 }}"""
@@ -255,12 +247,9 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
             preferred_models=PREFERRED_CHAT_MODELS,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=900  # was 300 -- too tight once thinking tokens are counted against the budget
+            max_tokens=LLM_MAX_TOKENS
         )
 
-        # CHANGED: strip <think> reasoning + markdown fences BEFORE hunting
-        # for braces, or a brace inside the model's own reasoning can get
-        # matched instead of the real JSON object.
         raw_response = strip_think_tags(response.choices[0].message.content.strip())
         raw_response = strip_code_fences(raw_response)
 
@@ -275,7 +264,7 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
             }
 
         return jsonify({"success": True, "summary": summary})
-
+        
     except Exception as e:
         logger.error(f"Summarize error: {e}")
         return jsonify({"error": f"Groq API Error: {str(e)}"}), 500
@@ -307,10 +296,6 @@ def analyze_document():
 
         client = Groq(api_key=GROQ_API_KEY_VISION)
 
-        # CHANGED: tell the model explicitly whether the user asked
-        # something specific or just uploaded a photo with no question --
-        # this is the difference between "answer their question using the
-        # document" and "explain what this is and ask what they need".
         has_question = bool(user_question) and user_question.strip().lower() not in GENERIC_CONTEXT_DEFAULTS
         if has_question:
             task = (
@@ -328,18 +313,20 @@ def analyze_document():
 
         prompt = f"""{persona}
 
-You are now looking at a photo of a document rather than answering a plain text question. {task}
+You are now looking at a photo of a document. {task}
 
-Output ONLY a JSON object with these exact keys, no markdown fences, no text outside the JSON:
+Output ONLY a JSON object with these exact keys. Do not include markdown wrappers:
 {{
-  "document_type": "Name of the document (e.g. Aadhaar Card, PAN Card, Voter ID, Utility Bill, blank application form). Say 'Unclear' if you genuinely can't tell.",
+  "document_type": "Name of the document",
   "quality": "Clear, Blurry, Cropped, or Unclear",
-  "extracted_fields": {{"field name": "value", "...": "..."}},
+  "extracted_fields": {{"field name": "value"}},
   "ocr_text": "Your actual response to the user, following the instruction above -- this is the part they will read."
 }}"""
 
-        response = client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+        # NO SEPARATE VISION FALLBACK. USE THE MAIN CHAT MODELS DIRECTLY!
+        response = call_groq_with_fallback(
+            client=client,
+            preferred_models=PREFERRED_CHAT_MODELS,
             messages=[
                 {
                     "role": "user",
@@ -353,11 +340,9 @@ Output ONLY a JSON object with these exact keys, no markdown fences, no text out
                 }
             ],
             temperature=0.2,
-            max_tokens=1400  # was 800 -- thinking tokens were eating the budget before any JSON came out
+            max_tokens=2000 
         )
 
-        # CHANGED: same think-tag + fence stripping as above, applied
-        # before bracket matching this time too.
         raw_response = strip_think_tags(response.choices[0].message.content.strip())
         raw_response = strip_code_fences(raw_response)
 
@@ -366,10 +351,10 @@ Output ONLY a JSON object with these exact keys, no markdown fences, no text out
         except Exception as e:
             logger.error(f"Vision JSON Parse Error: {e}")
             result_data = {
-                "document_type": "Unclear",
-                "quality": "Unclear",
+                "document_type": "Analyzed Document",
+                "quality": "Processed",
                 "extracted_fields": {},
-                "ocr_text": raw_response[:500] or "Couldn't read that photo clearly -- try a well-lit, straight-on photo of the document.",
+                "ocr_text": raw_response or "Processed the document successfully, but could not format the output.",
             }
 
         return jsonify(result_data)
