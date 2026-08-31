@@ -36,11 +36,6 @@ CHAT_HISTORY_TURNS = 4
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 2048
 
-_rate_limit_buckets = defaultdict(deque)
-_rate_limit_lock = Lock()
-RATE_LIMIT_MAX_REQUESTS = 25
-RATE_LIMIT_WINDOW_SECONDS = 60
-
 # Updated to Groq's new free tier & open-source models
 PREFERRED_CHAT_MODELS = [
     "openai/gpt-oss-120b", 
@@ -49,11 +44,16 @@ PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile"
 ]
 
+_rate_limit_buckets = defaultdict(deque)
+_rate_limit_lock = Lock()
+RATE_LIMIT_MAX_REQUESTS = 25
+RATE_LIMIT_WINDOW_SECONDS = 60
+
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ======================================================================
-# SMART MODEL FALLBACK ENGINE (AUTO-ADAPTS TO GROQ CHANGES)
+# SMART MODEL FALLBACK ENGINE
 # ======================================================================
 def call_groq_with_fallback(client, preferred_models, **kwargs):
     try:
@@ -107,7 +107,7 @@ def search_web_safe(query, max_results=SEARCH_MAX_RESULTS):
             for r in ddgs.text(query, max_results=max_results):
                 results.append({"title": r.get("title", ""), "url": r.get("href", ""), "snippet": r.get("body", "")})
     except Exception as e:
-        logger.warning(f"DuckDuckGo blocked/failed: {e}")
+        logger.warning(f"DuckDuckGo blocked: {e}")
     return results
 
 def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
@@ -222,9 +222,9 @@ def summarize_doc():
 {extracted_text[:1500]}
 --- END TEXT ---
 
-Output ONLY a JSON object with this exact structure. Do not use markdown wrappers.
+Output ONLY a JSON object with this exact structure.
 {{
-  "document_type": "Short name (e.g. Aadhaar Card, PAN Card, Income Certificate, Marksheet, Other)",
+  "document_type": "Short name",
   "description": "1 clear sentence explaining what this document proves.",
   "actionable_steps": "1 brief sentence on where or how to use this document."
 }}"""
@@ -239,14 +239,18 @@ Output ONLY a JSON object with this exact structure. Do not use markdown wrapper
         )
 
         raw_response = response.choices[0].message.content.strip()
-        summary = {}
+        
+        # BULLETPROOF JSON PARSING
         try:
-            clean = re.sub(r"^```(?:json)?\n?", "", raw_response)
-            clean = re.sub(r"\n?```$", "", clean)
-            json_match = re.search(r'\{.*\}', clean, re.DOTALL)
-            if json_match: summary = json.loads(json_match.group())
-            else: raise ValueError("No JSON object found")
-        except Exception:
+            start_idx = raw_response.find('{')
+            end_idx = raw_response.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                json_string = raw_response[start_idx:end_idx+1]
+                summary = json.loads(json_string)
+            else:
+                raise ValueError("No braces found")
+        except Exception as e:
+            logger.error(f"Summarize JSON Parse Error: {e}")
             summary = {
                 "document_type": "Official Document",
                 "description": "Analyzed document based on extracted text.",
@@ -269,29 +273,27 @@ def analyze_document():
         file = request.files["document"]
         context = request.form.get("context", "Analyze this document.")
         
-        # Read the file and convert it to Base64 so Groq Vision can see it
         image_bytes = file.read()
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         mime_type = file.content_type or "image/jpeg"
         
-        # Must use a specific Vision model for images
         client = Groq(api_key=GROQ_API_KEY_VISION)
         
         prompt = f"""You are an expert AI assistant helping Indian citizens with paperwork.
         Look at this document image. 
         User's context/question: {context}
         
-        Output ONLY a JSON object with these exact keys. Do NOT wrap in markdown blocks like ```json.
+        Output ONLY a JSON object with these exact keys.
         {{
           "document_type": "Name of document (e.g. PAN, Voter ID, Utility Bill, Unknown)",
           "quality": "Legibility (e.g. Clear, Blurry, Cropped)",
-          "extracted_fields": {{"Name": "Value", "Date": "Value"}},
+          "extracted_fields": {{"Name": "Value"}},
           "ocr_text": "A brief 2-3 sentence summary of the visible text/content."
         }}
         """
         
         response = client.chat.completions.create(
-            model="qwen/qwen3.6-27b", # Guaranteed active, free Groq Multimodal Vision Model
+            model="qwen/qwen3.6-27b",
             messages=[
                 {
                     "role": "user",
@@ -312,19 +314,22 @@ def analyze_document():
         
         raw_response = response.choices[0].message.content.strip()
         
-        # Clean and parse the JSON string from the AI
-        clean = re.sub(r"^```(?:json)?\n?", "", raw_response)
-        clean = re.sub(r"\n?```$", "", clean)
-        json_match = re.search(r'\{.*\}', clean, re.DOTALL)
-        
-        if json_match:
-            result_data = json.loads(json_match.group())
-        else:
+        # BULLETPROOF JSON PARSING
+        try:
+            start_idx = raw_response.find('{')
+            end_idx = raw_response.rfind('}')
+            if start_idx != -1 and end_idx != -1:
+                json_string = raw_response[start_idx:end_idx+1]
+                result_data = json.loads(json_string)
+            else:
+                raise ValueError("No braces found in AI response")
+        except Exception as e:
+            logger.error(f"Vision JSON Parse Error: {e}")
             result_data = {
                 "document_type": "Document",
                 "quality": "Unknown",
                 "extracted_fields": {},
-                "ocr_text": raw_response[:200]
+                "ocr_text": raw_response[:300] # Pass whatever the AI said directly to the user
             }
             
         return jsonify(result_data)
