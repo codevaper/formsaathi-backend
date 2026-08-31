@@ -34,14 +34,14 @@ SEARCH_MAX_RESULTS = 2
 SCRAPE_TIMEOUT_SECONDS = 2.0  
 CHAT_HISTORY_TURNS = 4
 LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 4000  # Increased heavily for detailed thinking & output
+LLM_MAX_TOKENS = 4000  
 
-# Updated to Groq's new free tier & open-source models
+# Stable Text Models
 PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
-    "qwen/qwen3.6-27b",
-    "openai/gpt-oss-120b", 
-    "openai/gpt-oss-20b"
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it"
 ]
 
 _rate_limit_buckets = defaultdict(deque)
@@ -78,18 +78,14 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
     raise last_error
 
 def call_groq_vision_with_fallback(client, messages, **kwargs):
-    try:
-        live_models_data = client.models.list().data
-        # Auto-detect ANY active vision model currently hosted by Groq
-        live_ids = [m.id for m in live_models_data if "vision" in m.id.lower()]
-        if not live_ids:
-            live_ids = ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]
-    except Exception as e:
-        logger.warning(f"Could not fetch live vision models: {e}")
-        live_ids = ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]
-
+    # Hardcoded active Groq Vision models - guarantees no decommission errors
+    vision_models = [
+        "llama-3.2-90b-vision-instruct", 
+        "llama-3.2-11b-vision-instruct"
+    ]
+    
     last_error = None
-    for model_name in live_ids:
+    for model_name in vision_models:
         try:
             kwargs['model'] = model_name
             return client.chat.completions.create(messages=messages, **kwargs)
@@ -110,7 +106,7 @@ def strip_think_tags(text):
     if not text: return text
     # Strip full closed <think> blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    # Strip any dangling literal <think> or </think> tags to prevent UI breakage
+    # Strip any dangling literal <think> or </think> tags
     text = re.sub(r'</?think>', '', text, flags=re.IGNORECASE)
     return text.strip()
 
@@ -178,7 +174,7 @@ def build_system_prompt(profile, language):
                 "Respond ONLY in Marathi (Devanagari)." if language == "mr" else \
                 "Respond ONLY in Indian English." if language == "en" else "Detect user language."
 
-    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning.\n3. Formatting: Use Markdown nicely.\n4. REDACT AADHAAR NUMBERS ALWAYS."
+    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning.\n3. Formatting: Use Markdown nicely.\n4. REDACT ALL GOVERNMENT ID NUMBERS ALWAYS."
     
     if experience in ("expert", "experienced") and age < 60:
         return base + "\n5. User is highly experienced. Be ultra-crisp, provide exact portal links, and TAT. Skip hand-holding."
@@ -307,16 +303,16 @@ def analyze_document():
 Look at this document image carefully. 
 User's prompt: "{context}"
 
-CRITICAL RULE: If you see an Aadhaar number, you MUST redact it as XXXX XXXX XXXX. Do not output the real digits.
+CRITICAL RULE: If you see sensitive government IDs, you MUST redact them. Do not output the real digits.
 
 Analyze the image and return ONLY a JSON object with these exact keys. No markdown wrappers around the JSON.
 {{
-  "document_type": "Name of document (e.g. PAN, Aadhaar, Utility Bill)",
+  "document_type": "Name of document (e.g. PAN, Voter ID, Utility Bill)",
   "quality": "Legibility (e.g. Clear, Blurry)",
   "extracted_fields": {{
       "AI Analysis": "Write a highly detailed, friendly, and comprehensive paragraph here. Explain what the document is, what information it contains, and directly answer the User's prompt. Make it incredibly helpful."
   }},
-  "ocr_text": "Transcribe the raw text visible in the document exactly as it appears. REDACT AADHAAR NUMBERS."
+  "ocr_text": "Transcribe the raw text visible in the document exactly as it appears. REDACT ID NUMBERS."
 }}"""
         
         response = call_groq_vision_with_fallback(
@@ -352,7 +348,6 @@ Analyze the image and return ONLY a JSON object with these exact keys. No markdo
                 raise ValueError("No braces found in AI response")
         except Exception as e:
             logger.error(f"Vision JSON Parse Error: {e}")
-            # Absolute Bulletproof Fallback: Dump the raw, un-truncated response into the AI Analysis block!
             result_data = {
                 "document_type": "Analyzed Document",
                 "quality": "Processed",
