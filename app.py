@@ -291,7 +291,7 @@ def analyze_document():
         """
         
         response = client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview", # Updated to the active Groq 90b vision model
+            model="meta-llama/llama-4-scout-17b-16e-instruct", # Groq's current active vision model
             messages=[
                 {
                     "role": "user",
