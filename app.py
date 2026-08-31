@@ -34,14 +34,14 @@ SEARCH_MAX_RESULTS = 2
 SCRAPE_TIMEOUT_SECONDS = 2.0  
 CHAT_HISTORY_TURNS = 4
 LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 2048
+LLM_MAX_TOKENS = 4000  # Increased heavily for detailed thinking & output
 
 # Updated to Groq's new free tier & open-source models
 PREFERRED_CHAT_MODELS = [
-    "openai/gpt-oss-120b", 
-    "openai/gpt-oss-20b", 
+    "llama-3.3-70b-versatile",
     "qwen/qwen3.6-27b",
-    "llama-3.3-70b-versatile"
+    "openai/gpt-oss-120b", 
+    "openai/gpt-oss-20b"
 ]
 
 _rate_limit_buckets = defaultdict(deque)
@@ -53,7 +53,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ======================================================================
-# SMART MODEL FALLBACK ENGINE
+# SMART MODEL FALLBACK ENGINES
 # ======================================================================
 def call_groq_with_fallback(client, preferred_models, **kwargs):
     try:
@@ -72,7 +72,29 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
             kwargs['model'] = model_name
             return client.chat.completions.create(**kwargs)
         except Exception as e:
-            logger.warning(f"Model {model_name} failed. Attempting next... Error: {e}")
+            logger.warning(f"Chat model {model_name} failed. Error: {e}")
+            last_error = e
+            continue
+    raise last_error
+
+def call_groq_vision_with_fallback(client, messages, **kwargs):
+    try:
+        live_models_data = client.models.list().data
+        # Auto-detect ANY active vision model currently hosted by Groq
+        live_ids = [m.id for m in live_models_data if "vision" in m.id.lower()]
+        if not live_ids:
+            live_ids = ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]
+    except Exception as e:
+        logger.warning(f"Could not fetch live vision models: {e}")
+        live_ids = ["llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]
+
+    last_error = None
+    for model_name in live_ids:
+        try:
+            kwargs['model'] = model_name
+            return client.chat.completions.create(messages=messages, **kwargs)
+        except Exception as e:
+            logger.warning(f"Vision model {model_name} failed. Error: {e}")
             last_error = e
             continue
     raise last_error
@@ -86,9 +108,10 @@ def safe_int(value, default):
 
 def strip_think_tags(text):
     if not text: return text
-    # This deletes everything between <think> and </think>
+    # Strip full closed <think> blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<think>.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    # Strip any dangling literal <think> or </think> tags to prevent UI breakage
+    text = re.sub(r'</?think>', '', text, flags=re.IGNORECASE)
     return text.strip()
 
 def is_rate_limited(client_id):
@@ -155,14 +178,14 @@ def build_system_prompt(profile, language):
                 "Respond ONLY in Marathi (Devanagari)." if language == "mr" else \
                 "Respond ONLY in Indian English." if language == "en" else "Detect user language."
 
-    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning. Answer immediately.\n3. Formatting: Use Markdown (## Headers, **Bold**, Lists) nicely."
+    base = f"You are FormSaathi, an Indian government assistant for {name} in {ward}, Mumbai.\nCRITICAL RULES:\n1. {lang_rule}\n2. NO <think> TAGS. DO NOT output your reasoning.\n3. Formatting: Use Markdown nicely.\n4. REDACT AADHAAR NUMBERS ALWAYS."
     
     if experience in ("expert", "experienced") and age < 60:
-        return base + "\n4. User is highly experienced. Be ultra-crisp, provide exact portal links, and TAT. Skip hand-holding."
+        return base + "\n5. User is highly experienced. Be ultra-crisp, provide exact portal links, and TAT. Skip hand-holding."
     elif age >= 60: 
-        return base + "\n4. Keep it simple. Max 3-4 steps. Mention physical offices."
+        return base + "\n5. Keep it simple. Max 3-4 steps. Mention physical offices."
     else: 
-        return base + "\n4. Be concise, digital-first, include links."
+        return base + "\n5. Be concise, digital-first, include links."
 
 # ======================================================================
 # API ENDPOINTS
@@ -236,7 +259,7 @@ Output ONLY a JSON object with this exact structure.
             preferred_models=PREFERRED_CHAT_MODELS,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=300
+            max_tokens=LLM_MAX_TOKENS
         )
 
         raw_response = response.choices[0].message.content.strip()
@@ -280,22 +303,24 @@ def analyze_document():
         
         client = Groq(api_key=GROQ_API_KEY_VISION)
         
-        # MASSIVELY IMPROVED PROMPT FOR BETTER, DETAILED ANSWERS
         prompt = f"""You are an expert AI assistant helping Indian citizens with paperwork.
-        Look at this document image carefully. 
-        User's prompt: "{context}"
+Look at this document image carefully. 
+User's prompt: "{context}"
+
+CRITICAL RULE: If you see an Aadhaar number, you MUST redact it as XXXX XXXX XXXX. Do not output the real digits.
+
+Analyze the image and return ONLY a JSON object with these exact keys. No markdown wrappers around the JSON.
+{{
+  "document_type": "Name of document (e.g. PAN, Aadhaar, Utility Bill)",
+  "quality": "Legibility (e.g. Clear, Blurry)",
+  "extracted_fields": {{
+      "AI Analysis": "Write a highly detailed, friendly, and comprehensive paragraph here. Explain what the document is, what information it contains, and directly answer the User's prompt. Make it incredibly helpful."
+  }},
+  "ocr_text": "Transcribe the raw text visible in the document exactly as it appears. REDACT AADHAAR NUMBERS."
+}}"""
         
-        Output ONLY a JSON object with these exact keys. Do NOT use markdown code blocks.
-        {{
-          "document_type": "Name of document (e.g. PAN, Voter ID, Utility Bill)",
-          "quality": "Legibility (e.g. Clear, Blurry)",
-          "extracted_fields": {{"Key Detail": "Value"}},
-          "ocr_text": "Write a highly detailed, comprehensive paragraph here. First, list all the important text and information you see. Second, directly answer the user's prompt thoroughly. If the user did not ask a specific question, explain what this document is generally used for and what their next steps might be."
-        }}
-        """
-        
-        response = client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
+        response = call_groq_vision_with_fallback(
+            client=client,
             messages=[
                 {
                     "role": "user",
@@ -311,12 +336,10 @@ def analyze_document():
                 }
             ],
             temperature=0.1,
-            max_tokens=1500
+            max_tokens=4000
         )
         
         raw_response = response.choices[0].message.content.strip()
-        
-        # CRITICAL FIX: Erase the <think> tags entirely before python touches it
         raw_response = strip_think_tags(raw_response)
         
         try:
@@ -329,12 +352,14 @@ def analyze_document():
                 raise ValueError("No braces found in AI response")
         except Exception as e:
             logger.error(f"Vision JSON Parse Error: {e}")
-            # INFINITE FALLBACK: If JSON breaks, give the user the ENTIRE detailed answer anyway!
+            # Absolute Bulletproof Fallback: Dump the raw, un-truncated response into the AI Analysis block!
             result_data = {
                 "document_type": "Analyzed Document",
                 "quality": "Processed",
-                "extracted_fields": {},
-                "ocr_text": raw_response 
+                "extracted_fields": {
+                    "AI Analysis": raw_response 
+                },
+                "ocr_text": "Raw text extracted and passed to chat." 
             }
             
         return jsonify(result_data)
