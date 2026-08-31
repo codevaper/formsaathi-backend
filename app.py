@@ -1,6 +1,5 @@
 """
-FormSaathi AI Unified Backend — Auto-Adapting Production Build
-Fully patched: Vision 400 error fixed using stable Vision models.
+FormSaathi AI Unified Backend - Final Production Build
 """
 
 import os, io, time, base64, logging, re, json
@@ -24,23 +23,30 @@ from groq import Groq
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("formsaathi")
 
-# API Keys fallback logic
+# API Keys
 DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_API_KEY_CHAT = os.environ.get("GROQ_API_KEY_CHAT", "").strip() or DEFAULT_GROQ_KEY
 GROQ_API_KEY_VISION = os.environ.get("GROQ_API_KEY_VISION", "").strip() or DEFAULT_GROQ_KEY
 
-# Limits & Settings
+# Limits
 SEARCH_MAX_RESULTS = 2
 SCRAPE_TIMEOUT_SECONDS = 2.0
 CHAT_HISTORY_TURNS = 4
 LLM_TEMPERATURE = 0.1
 LLM_MAX_TOKENS = 4000
 
-# Standard Text Models for chat
+# Models
 PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
     "mixtral-8x7b-32768"
+]
+
+VISION_MODELS = [
+    "llama-3.2-90b-vision-preview",
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-instruct",
+    "llama-3.2-11b-vision-instruct"
 ]
 
 GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
@@ -54,131 +60,31 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ======================================================================
-# SMART MODEL FALLBACK ENGINE
+# THINK-TAG STRIPPER (Bulletproof - no angle brackets in literals)
 # ======================================================================
-def call_groq_with_fallback(client, preferred_models, **kwargs):
-    try:
-        live_models_data = client.models.list().data
-        live_ids = {m.id for m in live_models_data}
-        available_models = [m for m in preferred_models if m in live_ids]
-        if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
-    except Exception as e:
-        logger.warning(f"Could not fetch live models: {e}")
-        available_models = preferred_models
-
-    last_error = None
-    for model_name in available_models:
-        try:
-            kwargs['model'] = model_name
-            return client.chat.completions.create(**kwargs)
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed. Error: {e}")
-            last_error = e
-            continue
-    raise last_error
-
-# ======================================================================
-# UTILS & SEARCH
-# ======================================================================
-def safe_int(value, default):
-    try: return int(value)
-    except (TypeError, ValueError): return default
+_THINK_OPEN = chr(60) + "think" + chr(62)
+_THINK_CLOSE = chr(60) + "/think" + chr(62)
+_THINK_PATTERN = _THINK_OPEN + ".*?" + _THINK_CLOSE
+_THINK_TAG = chr(60) + "/?" + "think" + chr(62)
 
 def strip_think_tags(text):
-    if not text: return text
-    text = re.sub(r'
-</think>
+    if not text:
+        return text
+    text = re.sub(_THINK_PATTERN, "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(_THINK_TAG, "", text, flags=re.IGNORECASE)
+    return text.strip()
 
-Gemini is **100% correct** this time. Their technical analysis of the error is spot-on, and my previous "fix" was indeed a hack that would have caused a context-length crash.
+def strip_code_fences(text):
+    if not text:
+        return text
+    return re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", text.strip())
 
-Here is why Gemini's code is the **true, permanent fix**:
-1. **The Root Cause:** Groq's API strictly forbids list-based content (text + image) inside the `system` role. It demands a plain string. 
-2. **Gemini's Solution:** They completely removed the `system` message for the vision endpoint and embedded the persona directly into the `user` message. The `user` role fully supports multimodal (text + image) arrays. This bypasses the 400 error elegantly.
-3. **Proper Vision Routing:** They correctly locked the endpoint to Groq's dedicated multimodal models instead of trying to force a text model to read base64 gibberish.
-
-### ✅ The Verdict: Use Gemini's Code (With One Small Safety Tweak)
-
-Gemini's code is perfect. I have taken their exact code and added **two extra fallback vision models** to the list. Groq frequently updates model names, so having both the `preview` and `instruct` variants guarantees your app will never break if Groq rotates their active models.
-
----
-
-### 📋 Exact Steps to Deploy (2 Minutes)
-
-**Step 1: Update Backend (GitHub)**
-1. Go to your GitHub repo `formsaathi-backend`.
-2. Open `app.py` → Click the ✏️ **pencil icon** to edit.
-3. Press `Ctrl + A` (select all) → Press `Delete`.
-4. Paste the **exact code below**.
-5. Scroll down → Click **"Commit changes"**.
-
-**Step 2: Deploy on Render**
-1. Go to Render Dashboard → Click `formsaathi-backend`.
-2. Click **"Manual Deploy"** → **"Deploy latest commit"**.
-3. Wait ~45 seconds until you see `Your service is live 🎉`.
-
-**Step 3: Frontend (VS Code)**
-* **Do nothing.** Your frontend code is already perfectly sending the file. No changes needed in VS Code.
-
----
-
-### 📄 The Final `app.py` (Copy-Paste This Exactly)
-
-```python
-"""
-FormSaathi AI Unified Backend — Auto-Adapting Production Build
-Fully patched: Vision 400 error fixed using stable Vision models.
-"""
-
-import os, io, time, base64, logging, re, json
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
-import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    from ddgs import DDGS
-
-from groq import Groq
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("formsaathi")
-
-# API Keys fallback logic
-DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_API_KEY_CHAT = os.environ.get("GROQ_API_KEY_CHAT", "").strip() or DEFAULT_GROQ_KEY
-GROQ_API_KEY_VISION = os.environ.get("GROQ_API_KEY_VISION", "").strip() or DEFAULT_GROQ_KEY
-
-# Limits & Settings
-SEARCH_MAX_RESULTS = 2
-SCRAPE_TIMEOUT_SECONDS = 2.0
-CHAT_HISTORY_TURNS = 4
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 4000
-
-# Standard Text Models for chat
-PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
-]
-
-GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
-
-_rate_limit_buckets = defaultdict(deque)
-_rate_limit_lock = Lock()
-RATE_LIMIT_MAX_REQUESTS = 25
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+def extract_json_object(text):
+    start_idx = text.find("{")
+    end_idx = text.rfind("}")
+    if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+        raise ValueError("No JSON object found in response")
+    return json.loads(text[start_idx:end_idx + 1])
 
 # ======================================================================
 # SMART MODEL FALLBACK ENGINE
@@ -189,537 +95,342 @@ def call_groq_with_fallback(client, preferred_models, **kwargs):
         live_ids = {m.id for m in live_models_data}
         available_models = [m for m in preferred_models if m in live_ids]
         if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
+            available_models = [
+                m.id for m in live_models_data
+                if "whisper" not in m.id and "tts" not in m.id
+            ]
     except Exception as e:
-        logger.warning(f"Could not fetch live models: {e}")
+        logger.warning("Could not fetch live models: %s", e)
         available_models = preferred_models
 
     last_error = None
     for model_name in available_models:
         try:
-            kwargs['model'] = model_name
+            kwargs["model"] = model_name
             return client.chat.completions.create(**kwargs)
         except Exception as e:
-            logger.warning(f"Model {model_name} failed. Error: {e}")
+            logger.warning("Model %s failed: %s", model_name, e)
             last_error = e
             continue
     raise last_error
 
 # ======================================================================
-# UTILS & SEARCH
+# UTILS
 # ======================================================================
 def safe_int(value, default):
-    try: return int(value)
-    except (TypeError, ValueError): return default
-
-def strip_think_tags(text):
-    if not text: return text
-    text = re.sub(r'
-</think>
-
-Gemini is **100% correct** this time. Their technical analysis of the error is spot-on, and my previous "fix" was indeed a hack that would have caused a context-length crash.
-
-Here is why Gemini's code is the **true, permanent fix**:
-1. **The Root Cause:** Groq's API strictly forbids list-based content (text + image) inside the `system` role. It demands a plain string. 
-2. **Gemini's Solution:** They completely removed the `system` message for the vision endpoint and embedded the persona directly into the `user` message. The `user` role fully supports multimodal (text + image) arrays. This bypasses the 400 error elegantly.
-3. **Proper Vision Routing:** They correctly locked the endpoint to Groq's dedicated multimodal models instead of trying to force a text model to read base64 gibberish.
-
-### ✅ The Verdict: Use Gemini's Code (With One Small Safety Tweak)
-
-Gemini's code is perfect. I have taken their exact code and added **two extra fallback vision models** to the list. Groq frequently updates model names, so having both the `preview` and `instruct` variants guarantees your app will never break if Groq rotates their active models.
-
----
-
-### 📋 Exact Steps to Deploy (2 Minutes)
-
-**Step 1: Update Backend (GitHub)**
-1. Go to your GitHub repo `formsaathi-backend`.
-2. Open `app.py` → Click the ✏️ **pencil icon** to edit.
-3. Press `Ctrl + A` (select all) → Press `Delete`.
-4. Paste the **exact code below**.
-5. Scroll down → Click **"Commit changes"**.
-
-**Step 2: Deploy on Render**
-1. Go to Render Dashboard → Click `formsaathi-backend`.
-2. Click **"Manual Deploy"** → **"Deploy latest commit"**.
-3. Wait ~45 seconds until you see `Your service is live 🎉`.
-
-**Step 3: Frontend (VS Code)**
-* **Do nothing.** Your frontend code is already perfectly sending the file. No changes needed in VS Code.
-
----
-
-### 📄 The Final `app.py` (Copy-Paste This Exactly)
-
-```python
-"""
-FormSaathi AI Unified Backend — Auto-Adapting Production Build
-Fully patched: Vision 400 error fixed using stable Vision models.
-"""
-
-import os, io, time, base64, logging, re, json
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
-import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    from ddgs import DDGS
-
-from groq import Groq
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("formsaathi")
-
-# API Keys fallback logic
-DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_API_KEY_CHAT = os.environ.get("GROQ_API_KEY_CHAT", "").strip() or DEFAULT_GROQ_KEY
-GROQ_API_KEY_VISION = os.environ.get("GROQ_API_KEY_VISION", "").strip() or DEFAULT_GROQ_KEY
-
-# Limits & Settings
-SEARCH_MAX_RESULTS = 2
-SCRAPE_TIMEOUT_SECONDS = 2.0
-CHAT_HISTORY_TURNS = 4
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 4000
-
-# Standard Text Models for chat
-PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
-]
-
-GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
-
-_rate_limit_buckets = defaultdict(deque)
-_rate_limit_lock = Lock()
-RATE_LIMIT_MAX_REQUESTS = 25
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# ======================================================================
-# SMART MODEL FALLBACK ENGINE
-# ======================================================================
-def call_groq_with_fallback(client, preferred_models, **kwargs):
     try:
-        live_models_data = client.models.list().data
-        live_ids = {m.id for m in live_models_data}
-        available_models = [m for m in preferred_models if m in live_ids]
-        if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
-    except Exception as e:
-        logger.warning(f"Could not fetch live models: {e}")
-        available_models = preferred_models
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
-    last_error = None
-    for model_name in available_models:
-        try:
-            kwargs['model'] = model_name
-            return client.chat.completions.create(**kwargs)
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed. Error: {e}")
-            last_error = e
-            continue
-    raise last_error
+def is_rate_limited(client_id):
+    now = time.time()
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets[client_id]
+        while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+            return True
+        bucket.append(now)
+        return False
 
-# ======================================================================
-# UTILS & SEARCH
-# ======================================================================
-def safe_int(value, default):
-    try: return int(value)
-    except (TypeError, ValueError): return default
-
-def strip_think_tags(text):
-    if not text: return text
-    text = re.sub(r'
-</think>
-
-Gemini is **100% correct** this time. Their technical analysis of the error is spot-on, and my previous "fix" was indeed a hack that would have caused a context-length crash.
-
-Here is why Gemini's code is the **true, permanent fix**:
-1. **The Root Cause:** Groq's API strictly forbids list-based content (text + image) inside the `system` role. It demands a plain string. 
-2. **Gemini's Solution:** They completely removed the `system` message for the vision endpoint and embedded the persona directly into the `user` message. The `user` role fully supports multimodal (text + image) arrays. This bypasses the 400 error elegantly.
-3. **Proper Vision Routing:** They correctly locked the endpoint to Groq's dedicated multimodal models instead of trying to force a text model to read base64 gibberish.
-
-### ✅ The Verdict: Use Gemini's Code (With One Small Safety Tweak)
-
-Gemini's code is perfect. I have taken their exact code and added **two extra fallback vision models** to the list. Groq frequently updates model names, so having both the `preview` and `instruct` variants guarantees your app will never break if Groq rotates their active models.
-
----
-
-### 📋 Exact Steps to Deploy (2 Minutes)
-
-**Step 1: Update Backend (GitHub)**
-1. Go to your GitHub repo `formsaathi-backend`.
-2. Open `app.py` → Click the ✏️ **pencil icon** to edit.
-3. Press `Ctrl + A` (select all) → Press `Delete`.
-4. Paste the **exact code below**.
-5. Scroll down → Click **"Commit changes"**.
-
-**Step 2: Deploy on Render**
-1. Go to Render Dashboard → Click `formsaathi-backend`.
-2. Click **"Manual Deploy"** → **"Deploy latest commit"**.
-3. Wait ~45 seconds until you see `Your service is live 🎉`.
-
-**Step 3: Frontend (VS Code)**
-* **Do nothing.** Your frontend code is already perfectly sending the file. No changes needed in VS Code.
-
----
-
-### 📄 The Final `app.py` (Copy-Paste This Exactly)
-
-```python
-"""
-FormSaathi AI Unified Backend — Auto-Adapting Production Build
-Fully patched: Vision 400 error fixed using stable Vision models.
-"""
-
-import os, io, time, base64, logging, re, json
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
-import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    from ddgs import DDGS
-
-from groq import Groq
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("formsaathi")
-
-# API Keys fallback logic
-DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_API_KEY_CHAT = os.environ.get("GROQ_API_KEY_CHAT", "").strip() or DEFAULT_GROQ_KEY
-GROQ_API_KEY_VISION = os.environ.get("GROQ_API_KEY_VISION", "").strip() or DEFAULT_GROQ_KEY
-
-# Limits & Settings
-SEARCH_MAX_RESULTS = 2
-SCRAPE_TIMEOUT_SECONDS = 2.0
-CHAT_HISTORY_TURNS = 4
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 4000
-
-# Standard Text Models for chat
-PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
-]
-
-GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
-
-_rate_limit_buckets = defaultdict(deque)
-_rate_limit_lock = Lock()
-RATE_LIMIT_MAX_REQUESTS = 25
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# ======================================================================
-# SMART MODEL FALLBACK ENGINE
-# ======================================================================
-def call_groq_with_fallback(client, preferred_models, **kwargs):
+def search_web_safe(query, max_results=SEARCH_MAX_RESULTS):
+    results = []
     try:
-        live_models_data = client.models.list().data
-        live_ids = {m.id for m in live_models_data}
-        available_models = [m for m in preferred_models if m in live_ids]
-        if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
+        with DDGS(timeout=3) as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({
+                    "title": r.get("title", ""),
+                    "url": r.get("href", ""),
+                    "snippet": r.get("body", "")
+                })
     except Exception as e:
-        logger.warning(f"Could not fetch live models: {e}")
-        available_models = preferred_models
+        logger.warning("DuckDuckGo error: %s", e)
+    return results
 
-    last_error = None
-    for model_name in available_models:
-        try:
-            kwargs['model'] = model_name
-            return client.chat.completions.create(**kwargs)
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed. Error: {e}")
-            last_error = e
-            continue
-    raise last_error
-
-# ======================================================================
-# UTILS & SEARCH
-# ======================================================================
-def safe_int(value, default):
-    try: return int(value)
-    except (TypeError, ValueError): return default
-
-def strip_think_tags(text):
-    if not text: return text
-    text = re.sub(r'
-</think>
-
-Gemini is **100% correct** this time. Their technical analysis of the error is spot-on, and my previous "fix" was indeed a hack that would have caused a context-length crash.
-
-Here is why Gemini's code is the **true, permanent fix**:
-1. **The Root Cause:** Groq's API strictly forbids list-based content (text + image) inside the `system` role. It demands a plain string. 
-2. **Gemini's Solution:** They completely removed the `system` message for the vision endpoint and embedded the persona directly into the `user` message. The `user` role fully supports multimodal (text + image) arrays. This bypasses the 400 error elegantly.
-3. **Proper Vision Routing:** They correctly locked the endpoint to Groq's dedicated multimodal models instead of trying to force a text model to read base64 gibberish.
-
-### ✅ The Verdict: Use Gemini's Code (With One Small Safety Tweak)
-
-Gemini's code is perfect. I have taken their exact code and added **two extra fallback vision models** to the list. Groq frequently updates model names, so having both the `preview` and `instruct` variants guarantees your app will never break if Groq rotates their active models.
-
----
-
-### 📋 Exact Steps to Deploy (2 Minutes)
-
-**Step 1: Update Backend (GitHub)**
-1. Go to your GitHub repo `formsaathi-backend`.
-2. Open `app.py` → Click the ✏️ **pencil icon** to edit.
-3. Press `Ctrl + A` (select all) → Press `Delete`.
-4. Paste the **exact code below**.
-5. Scroll down → Click **"Commit changes"**.
-
-**Step 2: Deploy on Render**
-1. Go to Render Dashboard → Click `formsaathi-backend`.
-2. Click **"Manual Deploy"** → **"Deploy latest commit"**.
-3. Wait ~45 seconds until you see `Your service is live 🎉`.
-
-**Step 3: Frontend (VS Code)**
-* **Do nothing.** Your frontend code is already perfectly sending the file. No changes needed in VS Code.
-
----
-
-### 📄 The Final `app.py` (Copy-Paste This Exactly)
-
-```python
-"""
-FormSaathi AI Unified Backend — Auto-Adapting Production Build
-Fully patched: Vision 400 error fixed using stable Vision models.
-"""
-
-import os, io, time, base64, logging, re, json
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
-import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    from ddgs import DDGS
-
-from groq import Groq
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("formsaathi")
-
-# API Keys fallback logic
-DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_API_KEY_CHAT = os.environ.get("GROQ_API_KEY_CHAT", "").strip() or DEFAULT_GROQ_KEY
-GROQ_API_KEY_VISION = os.environ.get("GROQ_API_KEY_VISION", "").strip() or DEFAULT_GROQ_KEY
-
-# Limits & Settings
-SEARCH_MAX_RESULTS = 2
-SCRAPE_TIMEOUT_SECONDS = 2.0
-CHAT_HISTORY_TURNS = 4
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 4000
-
-# Standard Text Models for chat
-PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
-]
-
-GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
-
-_rate_limit_buckets = defaultdict(deque)
-_rate_limit_lock = Lock()
-RATE_LIMIT_MAX_REQUESTS = 25
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# ======================================================================
-# SMART MODEL FALLBACK ENGINE
-# ======================================================================
-def call_groq_with_fallback(client, preferred_models, **kwargs):
+def scrape_url(url, timeout=SCRAPE_TIMEOUT_SECONDS):
     try:
-        live_models_data = client.models.list().data
-        live_ids = {m.id for m in live_models_data}
-        available_models = [m for m in preferred_models if m in live_ids]
-        if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
-    except Exception as e:
-        logger.warning(f"Could not fetch live models: {e}")
-        available_models = preferred_models
+        downloaded = trafilatura.fetch_url(url)
+        if downloaded:
+            text = trafilatura.extract(downloaded, include_comments=False, include_tables=False)
+            if text and len(text.strip()) > 80:
+                return text.strip()[:1500]
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        return soup.get_text(separator=" ", strip=True)[:1500]
+    except Exception:
+        return None
 
-    last_error = None
-    for model_name in available_models:
-        try:
-            kwargs['model'] = model_name
-            return client.chat.completions.create(**kwargs)
-        except Exception as e:
-            logger.warning(f"Model {model_name} failed. Error: {e}")
-            last_error = e
-            continue
-    raise last_error
+def get_context_for_query(query):
+    search_results = search_web_safe(query)
+    all_context, sources = [], []
+    if not search_results:
+        return "", []
+    with ThreadPoolExecutor(max_workers=min(len(search_results), 3)) as executor:
+        future_to_url = {executor.submit(scrape_url, r["url"]): r["url"] for r in search_results}
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                text = future.result()
+                if text:
+                    title = next((r["title"] for r in search_results if r["url"] == url), "Source")
+                    all_context.append("[{}] ({})\n{}".format(title, url, text))
+                    sources.append({"title": title, "url": url})
+            except Exception:
+                continue
+    return "\n\n---\n\n".join(all_context), sources
 
-# ======================================================================
-# UTILS & SEARCH
-# ======================================================================
-def safe_int(value, default):
-    try: return int(value)
-    except (TypeError, ValueError): return default
+def build_system_prompt(profile, language):
+    name = profile.get("name") or "User"
+    age = safe_int(profile.get("age"), 30)
+    ward = profile.get("ward") or "Mumbai"
+    experience = profile.get("experience") or "first_time"
 
-def strip_think_tags(text):
-    if not text: return text
-    text = re.sub(r'
-</think>
+    if language == "hi":
+        lang_rule = "Respond ONLY in Hindi (Devanagari). Use aap and ji."
+    elif language == "mr":
+        lang_rule = "Respond ONLY in Marathi (Devanagari)."
+    elif language == "en":
+        lang_rule = "Respond ONLY in Indian English."
+    else:
+        lang_rule = "Detect user language and respond in the same language."
 
-Gemini is **100% correct** this time. Their technical analysis of the error is spot-on, and my previous "fix" was indeed a hack that would have caused a context-length crash.
+    base = (
+        "You are FormSaathi, an Indian government assistant for {} in {}, Mumbai.\n"
+        "CRITICAL RULES:\n"
+        "1. {}\n"
+        "2. DO NOT output any thinking or reasoning tags.\n"
+        "3. Use Markdown formatting.\n"
+        "4. REDACT AADHAAR NUMBERS AS XXXX XXXX XXXX ALWAYS."
+    ).format(name, ward, lang_rule)
 
-Here is why Gemini's code is the **true, permanent fix**:
-1. **The Root Cause:** Groq's API strictly forbids list-based content (text + image) inside the `system` role. It demands a plain string. 
-2. **Gemini's Solution:** They completely removed the `system` message for the vision endpoint and embedded the persona directly into the `user` message. The `user` role fully supports multimodal (text + image) arrays. This bypasses the 400 error elegantly.
-3. **Proper Vision Routing:** They correctly locked the endpoint to Groq's dedicated multimodal models instead of trying to force a text model to read base64 gibberish.
-
-### ✅ The Verdict: Use Gemini's Code (With One Small Safety Tweak)
-
-Gemini's code is perfect. I have taken their exact code and added **two extra fallback vision models** to the list. Groq frequently updates model names, so having both the `preview` and `instruct` variants guarantees your app will never break if Groq rotates their active models.
-
----
-
-### 📋 Exact Steps to Deploy (2 Minutes)
-
-**Step 1: Update Backend (GitHub)**
-1. Go to your GitHub repo `formsaathi-backend`.
-2. Open `app.py` → Click the ✏️ **pencil icon** to edit.
-3. Press `Ctrl + A` (select all) → Press `Delete`.
-4. Paste the **exact code below**.
-5. Scroll down → Click **"Commit changes"**.
-
-**Step 2: Deploy on Render**
-1. Go to Render Dashboard → Click `formsaathi-backend`.
-2. Click **"Manual Deploy"** → **"Deploy latest commit"**.
-3. Wait ~45 seconds until you see `Your service is live 🎉`.
-
-**Step 3: Frontend (VS Code)**
-* **Do nothing.** Your frontend code is already perfectly sending the file. No changes needed in VS Code.
-
----
-
-### 📄 The Final `app.py` (Copy-Paste This Exactly)
-
-```python
-"""
-FormSaathi AI Unified Backend — Auto-Adapting Production Build
-Fully patched: Vision 400 error fixed using stable Vision models.
-"""
-
-import os, io, time, base64, logging, re, json
-from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-
-import requests
-import trafilatura
-from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-try:
-    from duckduckgo_search import DDGS
-except ImportError:
-    from ddgs import DDGS
-
-from groq import Groq
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("formsaathi")
-
-# API Keys fallback logic
-DEFAULT_GROQ_KEY = os.environ.get("GROQ_API_KEY", "").strip()
-GROQ_API_KEY_CHAT = os.environ.get("GROQ_API_KEY_CHAT", "").strip() or DEFAULT_GROQ_KEY
-GROQ_API_KEY_VISION = os.environ.get("GROQ_API_KEY_VISION", "").strip() or DEFAULT_GROQ_KEY
-
-# Limits & Settings
-SEARCH_MAX_RESULTS = 2
-SCRAPE_TIMEOUT_SECONDS = 2.0
-CHAT_HISTORY_TURNS = 4
-LLM_TEMPERATURE = 0.1
-LLM_MAX_TOKENS = 4000
-
-# Standard Text Models for chat
-PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768"
-]
-
-GENERIC_CONTEXT_DEFAULTS = {"analyze this image.", "analyze this document.", "analyze this scanned pdf."}
-
-_rate_limit_buckets = defaultdict(deque)
-_rate_limit_lock = Lock()
-RATE_LIMIT_MAX_REQUESTS = 25
-RATE_LIMIT_WINDOW_SECONDS = 60
-
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+    if experience in ("expert", "experienced") and age < 60:
+        return base + "\n5. User is experienced. Be ultra-crisp, provide portal links and TAT."
+    elif age >= 60:
+        return base + "\n5. Keep it simple. Max 3-4 steps. Mention physical offices."
+    else:
+        return base + "\n5. Be concise, digital-first, include links."
 
 # ======================================================================
-# SMART MODEL FALLBACK ENGINE
+# ENDPOINTS
 # ======================================================================
-def call_groq_with_fallback(client, preferred_models, **kwargs):
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"status": "FormSaathi Backend Online"})
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "groq": bool(GROQ_API_KEY_CHAT)})
+
+@app.route("/ask", methods=["POST", "OPTIONS"])
+def ask():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if is_rate_limited(client_id):
+        return jsonify({"error": "Too many requests."}), 429
+
     try:
-        live_models_data = client.models.list().data
-        live_ids = {m.id for m in live_models_data}
-        available_models = [m for m in preferred_models if m in live_ids]
-        if not available_models:
-            available_models = [m.id for m in live_models_data if "whisper" not in m.id and "vision" not in m.id]
+        data = request.get_json(silent=True) or {}
+        query = (data.get("query") or "").strip()
+        if not query:
+            return jsonify({"error": "Missing query"}), 400
+
+        context, sources = get_context_for_query(query)
+        system_prompt = build_system_prompt(data.get("profile") or {}, data.get("language") or "auto")
+
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in (data.get("chat_history") or [])[-CHAT_HISTORY_TURNS:]:
+            messages.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+
+        if context:
+            user_msg = "REFERENCE DATA:\n{}\n\nQUESTION: {}".format(context[:2500], query)
+        else:
+            user_msg = query
+        messages.append({"role": "user", "content": user_msg})
+
+        client = Groq(api_key=GROQ_API_KEY_CHAT)
+        response = call_groq_with_fallback(
+            client=client,
+            preferred_models=PREFERRED_CHAT_MODELS,
+            messages=messages,
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_TOKENS
+        )
+
+        clean_answer = strip_think_tags(response.choices[0].message.content)
+        return jsonify({"success": True, "answer": clean_answer, "sources": sources})
+
     except Exception as e:
-        logger.warning(f"Could not fetch live models: {e}")
-        available_models = preferred_models
+        logger.error("Chat error: %s", e)
+        return jsonify({"error": "AI Error: {}".format(str(e))}), 500
 
-    last_error = None
-    for model_name in available_models:
+@app.route("/summarize-doc", methods=["POST", "OPTIONS"])
+def summarize_doc():
+    if request.method == "OPTIONS":
+        return "", 204
+    try:
+        data = request.get_json(silent=True) or {}
+        extracted_text = (data.get("text") or "").strip()
+        if not extracted_text:
+            return jsonify({"error": "No text provided"}), 400
+
+        prompt = (
+            "Based on this extracted OCR text:\n"
+            "--- START TEXT ---\n"
+            "{}\n"
+            "--- END TEXT ---\n\n"
+            "Output ONLY a JSON object:\n"
+            "{{\n"
+            '  "document_type": "Short name",\n'
+            '  "description": "1 sentence what this proves",\n'
+            '  "actionable_steps": "1 sentence where to use it"\n'
+            "}}"
+        ).format(extracted_text[:1500])
+
+        client = Groq(api_key=GROQ_API_KEY_CHAT)
+        response = call_groq_with_fallback(
+            client=client,
+            preferred_models=PREFERRED_CHAT_MODELS,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=LLM_MAX_TOKENS
+        )
+
+        raw_response = strip_think_tags(response.choices[0].message.content.strip())
+        raw_response = strip_code_fences(raw_response)
+
         try:
-            kwargs['model'] = model_name
-            return client.chat.completions.create(**kwargs)
+            summary = extract_json_object(raw_response)
         except Exception as e:
-            logger.warning(f"Model {model_name} failed. Error: {e}")
-            last_error = e
-            continue
-    raise last_error
+            logger.error("Summarize JSON Parse Error: %s", e)
+            summary = {
+                "document_type": "Official Document",
+                "description": "Analyzed document.",
+                "actionable_steps": raw_response[:150]
+            }
+        return jsonify({"success": True, "summary": summary})
 
-# ======================================================================
-# UTILS & SEARCH
-# ======================================================================
-def safe_int(value, default):
-    try: return int(value)
-    except (TypeError, ValueError): return default
+    except Exception as e:
+        logger.error("Summarize error: %s", e)
+        return jsonify({"error": "API Error: {}".format(str(e))}), 500
 
-def strip_think_tags(text):
-    if not text: return text
-    text = re.sub(r'
+@app.route("/analyze-document", methods=["POST", "OPTIONS"])
+def analyze_document():
+    if request.method == "OPTIONS":
+        return "", 204
+
+    client_id = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    if is_rate_limited(client_id):
+        return jsonify({"error": "Too many requests."}), 429
+
+    try:
+        if "document" not in request.files:
+            return jsonify({"error": "No document uploaded"}), 400
+
+        file = request.files["document"]
+        user_question = (request.form.get("context") or "").strip()
+        language = request.form.get("language") or "auto"
+        try:
+            profile = json.loads(request.form.get("profile") or "{}")
+        except (TypeError, ValueError):
+            profile = {}
+
+        image_bytes = file.read()
+        if not image_bytes:
+            return jsonify({"error": "Uploaded file is empty."}), 400
+
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        mime_type = file.content_type or "image/jpeg"
+
+        client = Groq(api_key=GROQ_API_KEY_VISION)
+
+        has_question = bool(user_question) and user_question.strip().lower() not in GENERIC_CONTEXT_DEFAULTS
+
+        if has_question:
+            task = 'The user asked: "{}" -- answer directly using what is visible, then note the document type.'.format(user_question)
+        else:
+            task = "Identify the document, explain in 2-3 sentences what it is and what it is used for, then ask what help they need."
+
+        persona = build_system_prompt(profile, language)
+
+        prompt = (
+            "{}\n\n"
+            "You are looking at a photo of a document. {}\n\n"
+            "Output ONLY a JSON object with these keys:\n"
+            "{{\n"
+            '  "document_type": "Name of document",\n'
+            '  "quality": "Clear or Blurry or Cropped or Unclear",\n'
+            '  "extracted_fields": {{"field": "value"}},\n'
+            '  "ocr_text": "Your readable response to the user"\n'
+            "}}"
+        ).format(persona, task)
+
+        # PROPER MULTIMODAL STRUCTURE - image in user message only
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:{};base64,{}".format(mime_type, base64_image)
+                        }
+                    }
+                ]
+            }
+        ]
+
+        # Try each vision model until one works
+        last_error = None
+        raw_response = None
+
+        for model in VISION_MODELS:
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=2000
+                )
+                raw_response = response.choices[0].message.content.strip()
+                logger.info("Vision success with model: %s", model)
+                break
+            except Exception as e:
+                logger.warning("Vision model %s failed: %s", model, e)
+                last_error = e
+                continue
+
+        if not raw_response:
+            logger.error("All vision models failed. Last error: %s", last_error)
+            return jsonify({"error": "Vision analysis failed: {}".format(str(last_error))}), 500
+
+        raw_response = strip_think_tags(raw_response)
+        raw_response = strip_code_fences(raw_response)
+
+        try:
+            result_data = extract_json_object(raw_response)
+        except Exception as e:
+            logger.error("Vision JSON Parse Error: %s", e)
+            result_data = {
+                "document_type": "Analyzed Document",
+                "quality": "Processed",
+                "extracted_fields": {},
+                "ocr_text": raw_response or "Processed successfully but could not format output."
+            }
+
+        return jsonify(result_data)
+
+    except Exception as e:
+        logger.error("Vision error: %s", e)
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
